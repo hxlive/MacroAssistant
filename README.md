@@ -1,6 +1,8 @@
 # MacroAssistant
 MacroAssistant-宏助手
 
+MacroAssistant-宏助手 是利用python+tesseract+winocr制作的一个宏助手。利用它可以通过快速的添加一些键鼠指令来实现自动化操作。
+
 文件说明：  
 - MacroAssistant.py---------程序界面  
 - core_engine.py------------功能代码  
