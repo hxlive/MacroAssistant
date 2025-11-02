@@ -1,2 +1,2 @@
 # MacroAssistant
-MacroAssistant-红助手
+MacroAssistant-宏助手
