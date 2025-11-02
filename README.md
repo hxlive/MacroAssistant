@@ -11,6 +11,6 @@ MacroAssistant-宏助手
 - MacroAssistant.spec ------spec文件
 
 用法：  
-下载源码后，直接在python中执行。
+下载源码后，直接在python中执行。  
 编译独立exe，文件可能会有点大，毕竟 tesseract_local 就接近115M了。
 
