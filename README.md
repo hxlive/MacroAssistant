@@ -1,8 +1,27 @@
 # MacroAssistant
 MacroAssistant-宏助手
 
-MacroAssistant-宏助手 是利用python+tesseract+winocr制作的一个宏助手。
-利用它可以通过快速的添加一些键鼠指令来实现自动化操作。
+宏助手 是一款开源免费的 桌面自动化工具，专为简化重复性任务而设计。无论是游戏自动化、办公流程优化，还是 UI 测试，宏助手通过图像识别和OCR 文字识别，帮助用户快速录制和执行自动化脚本。无需编程经验，通过直观的 GUI 界面即可轻松上手。
+经过多次迭代，优化了性能和稳定性，提供快速响应和高精度识别，适合个人用户和开发者使用。
+
+核心功能：  
+- 图像识别：通过 OpenCV 的 cv2.matchTemplate，实现8ms 超快图像查找，支持模糊匹配（confidence 可调）。  
+- OCR 文字识别：集成 WinOCR（Windows 内置，快速）、RapidOCR（深度学习，精准）、Tesseract（兜底方案），支持中英文识别，复杂场景准确率达 90%+。  
+- 自动化脚本：支持点击、输入、移动、等待、条件判断（IF/ELSE）、循环（LOOP）等操作，灵活构建复杂自动化流程。
+- GUI 界面：基于 ttkbootstrap，提供清晰的步骤编辑器、实时状态显示和最近文件列表。
+- 热键控制：使用 Ctrl+F10 启动和 Ctrl+F11 停止，避免与其他程序冲突。
+
+适用场景：  
+- 游戏自动化：自动点击、刷任务、切换窗口。
+- 办公效率：批量填写表单、数据录入、窗口操作。
+- 测试工具：模拟用户交互，验证 UI 功能。
+- 日常重复任务：自动处理固定流程，提升效率。
+
+注意事项：  
+- 安全性：完全离线运行，无网络请求，数据安全。
+- 开源协议：MIT 协议，可自由修改和分享。
+- 调试支持：控制台输出详细日志，macro_perf.log 记录性能数据。
+- 依赖安装：若 RapidOCR 初始化失败，请安装 VC++ 运行库。
 
 文件说明：  
 - MacroAssistant.py---------程序界面  
@@ -12,8 +31,4 @@ MacroAssistant-宏助手 是利用python+tesseract+winocr制作的一个宏助�
 - app_icon.ico---------------应用程序图标  
 - tesseract_local.7z----------tesseract（用于ocr）
 - MacroAssistant.spec ------spec文件
-
-用法：  
-下载源码后，直接在python中执行。  
-编译独立exe，文件可能会有点大，毕竟 tesseract_local 就接近115M了。
 
