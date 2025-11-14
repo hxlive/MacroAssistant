@@ -1,7 +1,7 @@
 # MacroAssistant.py
 # 描述：自动化宏的 GUI 界面
-# 版本：1.46.6
-# 变更：增加 OCR 引擎静默预热线程
+# 版本：1.50.0
+# 变更：应用最终的动作列表（两位数前缀），实现完美对齐
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -19,7 +19,7 @@ from PIL import ImageGrab
 # =================================================================
 # 全局配置
 # =================================================================
-APP_VERSION = "1.46.6"
+APP_VERSION = "1.50.0"
 APP_TITLE = f"宏助手 (Macro Assistant) V{APP_VERSION}"
 APP_ICON = "app_icon.ico" 
 CONFIG_FILE = "macro_settings.json"
@@ -40,21 +40,23 @@ except ImportError:
     messagebox.showerror("导入错误", "未找到 'core_engine.py' 或 'ocr_engine.py'。\n请确保它们与 'MacroAssistant.py' 位于同一目录。")
     exit()
 
+# 【变更】使用两位数前缀实现完美对齐
 ACTION_TRANSLATIONS = {
-    'FIND_IMAGE': '1. 查找图像',
-    'FIND_TEXT': '2. 查找文本 (OCR)',
-    'MOVE_OFFSET': '3. 相对移动',
-    'CLICK': '4. 点击鼠标',
-    'WAIT': '5. 等待',
-    'TYPE_TEXT': '6. 输入文本 (中文/粘贴)',
-    'PRESS_KEY': '7. 按下按键',
-    'MOVE_TO': '8. 移动到 (绝对坐标)',
-    'IF_IMAGE_FOUND': '9. IF 找到图像',
-    'IF_TEXT_FOUND': '10. IF 找到文本',
-    'ELSE': '11. ELSE',
-    'END_IF': '12. END_IF',
-    'LOOP_START': '13. 循环开始 (Loop)',
-    'END_LOOP': '14. 结束循环 (EndLoop)',
+    'FIND_IMAGE':     '01.  查找图像',
+    'FIND_TEXT':      '02.  查找文本 (OCR)',
+    'MOVE_OFFSET':    '03.  相对移动',
+    'MOVE_TO':        '04.  移动到 (绝对坐标)',
+    'CLICK':          '05.  点击鼠标',
+    'SCROLL':         '06.  滚动滚轮',
+    'WAIT':           '07.  等待',
+    'TYPE_TEXT':      '08.  输入文本',
+    'PRESS_KEY':      '09.  按下按键',
+    'IF_IMAGE_FOUND': '10.  IF 找到图像',
+    'IF_TEXT_FOUND':  '11.  IF 找到文本',
+    'ELSE':           '12.  ELSE',
+    'END_IF':         '13.  END_IF',
+    'LOOP_START':     '14.  循环开始 (Loop)',
+    'END_LOOP':       '15.  结束循环 (EndLoop)',
 }
 LANG_OPTIONS = {'chi_sim (简体中文)': 'chi_sim', 'eng (英文)': 'eng'}
 CLICK_OPTIONS = {'left (左键)': 'left', 'right (右键)': 'right', 'middle (中键)': 'middle'}
@@ -68,6 +70,11 @@ class MacroApp:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry("950x700")
+        
+        self.font_ui = ("Microsoft YaHei UI", 10)
+        self.font_code = ("Consolas", 10)
+        
+        self.root.style.configure(".", font=self.font_ui)
         
         self.is_app_running = True
         self.root.protocol("WM_DELETE_WINDOW", self.on_exit)
@@ -89,15 +96,21 @@ class MacroApp:
         self.recent_files = []
         self.status_queue = queue.Queue()
         
+        self.mouse_tracker_job = None
+        self.mouse_pos_var = tb.StringVar()
+        
+        self.dynamic_wrap_labels = []
+        
         self.menu_bar = tk.Menu(root)
         self.root.config(menu=self.menu_bar)
-        file_menu = tk.Menu(self.menu_bar, tearoff=0)
-        self.menu_bar.add_cascade(label="文件", menu=file_menu)
-        file_menu.add_command(label="新建宏 (Ctrl+N)", command=self.new_macro)
-        file_menu.add_command(label="打开宏... (Ctrl+O)", command=self.load_macro)
-        file_menu.add_command(label="保存宏... (Ctrl+S)", command=self.save_macro)
+        
+        file_menu = tk.Menu(self.menu_bar, tearoff=0, font=self.font_ui)
+        self.menu_bar.add_cascade(label="  文件  ", menu=file_menu)
+        file_menu.add_command(label="📄 新建宏", accelerator="Ctrl+N", command=self.new_macro)
+        file_menu.add_command(label="📂 打开宏...", accelerator="Ctrl+O", command=self.load_macro)
+        file_menu.add_command(label="💾 保存宏...", accelerator="Ctrl+S", command=self.save_macro)
         file_menu.add_separator()
-        self.recent_files_menu = tk.Menu(file_menu, tearoff=0)
+        self.recent_files_menu = tk.Menu(file_menu, tearoff=0, font=self.font_ui)
         file_menu.add_cascade(label="最近加载", menu=self.recent_files_menu)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.on_exit)
@@ -106,8 +119,9 @@ class MacroApp:
         self.root.bind('<Control-o>', lambda e: self.load_macro())
         self.root.bind('<Control-s>', lambda e: self.save_macro())
 
-        theme_menu = tk.Menu(self.menu_bar, tearoff=0)
-        self.menu_bar.add_cascade(label="主题", menu=theme_menu)
+        theme_menu = tk.Menu(self.menu_bar, tearoff=0, font=self.font_ui)
+        self.menu_bar.add_cascade(label="  主题  ", menu=theme_menu)
+        
         light_themes = ['litera', 'cosmo', 'flatly', 'journal', 'lumen', 'minty', 'pulse', 'sandstone', 'united', 'yeti']
         for theme in light_themes:
             theme_menu.add_radiobutton(label=f"亮 - {theme.capitalize()}", variable=self.current_theme, value=theme, command=self.change_theme)
@@ -119,11 +133,11 @@ class MacroApp:
         status_bar_frame = ttk.Frame(root, bootstyle="primary")
         status_bar_frame.pack(side=tk.BOTTOM, fill=tk.X)
         self.status_var = tk.StringVar()
-        self.status_var.set("准备就绪...  |  [Ctrl+F10] 启动宏  |  [Ctrl+F11] 停止宏")
-        self.status_label_left = ttk.Label(status_bar_frame, textvariable=self.status_var, relief=tk.FLAT, anchor=tk.W, padding=5, bootstyle="primary-inverse")
+        self.status_var.set("准备就绪...   |   [Ctrl+F10] 启动宏   |   [Ctrl+F11] 停止宏")
+        self.status_label_left = ttk.Label(status_bar_frame, textvariable=self.status_var, relief=tk.FLAT, anchor=tk.W, padding=5, bootstyle="primary-inverse", font=self.font_ui)
         self.status_label_left.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.loop_status_var = tk.StringVar()
-        self.loop_status_label_right = ttk.Label(status_bar_frame, textvariable=self.loop_status_var, relief=tk.FLAT, anchor=tk.E, padding=(0, 5, 5, 5), bootstyle="primary-inverse")
+        self.loop_status_label_right = ttk.Label(status_bar_frame, textvariable=self.loop_status_var, relief=tk.FLAT, anchor=tk.E, padding=(0, 5, 5, 5), bootstyle="primary-inverse", font=self.font_ui)
         self.loop_status_label_right.pack(side=tk.RIGHT)
 
         main_frame = ttk.Frame(root)
@@ -131,34 +145,35 @@ class MacroApp:
 
         list_frame = ttk.Frame(main_frame, padding=10)
         list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ttk.Label(list_frame, text="宏步骤序列:", font=("微软雅黑", 12, "bold")).pack(anchor="w")
+        ttk.Label(list_frame, text="宏步骤序列:", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
 
         left_bottom_frame = ttk.Frame(list_frame)
         left_bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10,0))
         left_bottom_frame.columnconfigure(0, weight=1); left_bottom_frame.columnconfigure(1, weight=1)
         left_bottom_frame.columnconfigure(2, weight=1); left_bottom_frame.columnconfigure(3, weight=1)
 
-        self.move_up_btn = ttk.Button(left_bottom_frame, text="↑ 上移", command=lambda: self.move_step("up"), bootstyle="primary-outline")
+        self.move_up_btn = ttk.Button(left_bottom_frame, text="↑ 上移", command=lambda: self.move_step("up"), bootstyle="primary-outline", padding=(10, 6))
         self.move_up_btn.grid(row=0, column=0, sticky="nsew", padx=(0, 2), pady=(0, 5))
-        self.move_down_btn = ttk.Button(left_bottom_frame, text="↓ 下移", command=lambda: self.move_step("down"), bootstyle="primary-outline")
+        self.move_down_btn = ttk.Button(left_bottom_frame, text="↓ 下移", command=lambda: self.move_step("down"), bootstyle="primary-outline", padding=(10, 6))
         self.move_down_btn.grid(row=0, column=1, sticky="nsew", padx=2, pady=(0, 5))
-        self.remove_btn = ttk.Button(left_bottom_frame, text="🗑 删除选中", command=self.remove_step, bootstyle="danger-outline")
+        self.remove_btn = ttk.Button(left_bottom_frame, text="🗑 删除选中", command=self.remove_step, bootstyle="danger-outline", padding=(10, 6))
         self.remove_btn.grid(row=0, column=2, sticky="nsew", padx=2, pady=(0, 5))
-        self.load_step_btn = ttk.Button(left_bottom_frame, text="✎ 加载步骤", command=self.load_step_for_edit, bootstyle="info-outline")
+        self.load_step_btn = ttk.Button(left_bottom_frame, text="✎ 修改步骤", command=self.load_step_for_edit, bootstyle="info-outline", padding=(10, 6))
         self.load_step_btn.grid(row=0, column=3, sticky="nsew", padx=(2, 0), pady=(0, 5))
 
-        self.run_btn = ttk.Button(left_bottom_frame, text="▶ 运行宏 (Ctrl+F10)", command=self.run_macro, bootstyle="primary")
+        self.run_btn = ttk.Button(left_bottom_frame, text="▶ 运行宏 (Ctrl+F10)", command=self.run_macro, bootstyle="success", padding=(15, 10))
         self.run_btn.grid(row=1, column=0, columnspan=4, sticky="nsew", padx=(0, 0), pady=5) 
         
         check_frame = ttk.Frame(left_bottom_frame)
         check_frame.grid(row=2, column=0, columnspan=4, sticky="nsew", pady=(10, 0))
         check_frame.columnconfigure(0, weight=1); check_frame.columnconfigure(1, weight=1) 
+        
         skip_check = ttk.Checkbutton(check_frame, text="跳过运行前的确认提示", variable=self.skip_confirm_var, bootstyle="primary-round-toggle")
         skip_check.grid(row=0, column=0, sticky="w", padx=2) 
         minimize_check = ttk.Checkbutton(check_frame, text="运行时主界面不最小化", variable=self.dont_minimize_var, bootstyle="primary-round-toggle")
         minimize_check.grid(row=0, column=1, sticky="w", padx=2)
         
-        self.steps_listbox = tk.Listbox(list_frame, width=55, font=("Consolas", 10))
+        self.steps_listbox = tk.Listbox(list_frame, width=55, font=self.font_code)
         self.steps_listbox.pack(fill=tk.BOTH, expand=True, pady=5) 
 
         add_frame = ttk.Labelframe(main_frame, text="添加新步骤", padding=10)
@@ -167,34 +182,35 @@ class MacroApp:
         right_bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10,0))
         right_bottom_frame.columnconfigure(0, weight=2); right_bottom_frame.columnconfigure(1, weight=1) 
         
-        self.add_step_btn = ttk.Button(right_bottom_frame, text="＋ 添加到序列 >>", command=self.add_or_update_step, bootstyle="success")
+        self.add_step_btn = ttk.Button(right_bottom_frame, text="＋ 添加到序列 >>", command=self.add_or_update_step, bootstyle="success", padding=(12, 8))
         self.add_step_btn.grid(row=0, column=0, sticky="nsew", padx=(0, 2), columnspan=2)
-        self.cancel_edit_btn = ttk.Button(right_bottom_frame, text="✕ 取消修改", command=self.cancel_edit_mode, bootstyle="secondary")
+        self.cancel_edit_btn = ttk.Button(right_bottom_frame, text="✕ 取消修改", command=self.cancel_edit_mode, bootstyle="secondary", padding=(10, 6))
         
         ttk.Label(add_frame, text="选择动作:").pack(anchor="w")
-        self.action_type = ttk.Combobox(add_frame, state="readonly", width=30, font=("微软雅黑", 9), height=15)
+        self.action_type = ttk.Combobox(add_frame, state="readonly", width=30, font=self.font_ui, height=15)
         self.action_type['values'] = list(ACTION_TRANSLATIONS.values())
         self.action_type.current(0)
         self.action_type.pack(anchor="w", fill=tk.X, pady=5)
         self.action_type.bind("<<ComboboxSelected>>", self.update_param_fields)
         self.param_frame = ttk.Frame(add_frame)
         self.param_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        self.param_frame.bind("<Configure>", self._on_param_frame_configure)
+        
         self.param_widgets = {}
         self.update_param_fields(None)
         
         self.load_app_settings()
         self.update_recent_files_menu()
         
-        # 【优化】后台任务启动序列
-        # 1. 启动热键监听 (1秒后)
         self.root.after(1000, self.start_hotkey_listener)
-        # 2. 启动 OCR 引擎静默预热 (2秒后，避开热键启动高峰)
         self.root.after(2000, lambda: threading.Thread(target=ocr_engine.preload_engines, daemon=True).start())
-        
         self._check_status_queue()
 
     def on_exit(self):
         self.is_app_running = False
+        if self.mouse_tracker_job:
+            self.root.after_cancel(self.mouse_tracker_job)
         try:
             self.root.quit()
             self.root.destroy()
@@ -202,6 +218,14 @@ class MacroApp:
 
     def update_param_fields(self, event):
         self.last_test_location = None
+        
+        if self.mouse_tracker_job:
+            self.root.after_cancel(self.mouse_tracker_job)
+            self.mouse_tracker_job = None
+        self.mouse_pos_var.set("")
+        
+        self.dynamic_wrap_labels.clear()
+        
         for widget in self.param_frame.winfo_children(): widget.destroy()
         self.param_widgets = {}
         action_key = ACTION_KEYS_TO_NAME.get(self.action_type.get())
@@ -210,30 +234,43 @@ class MacroApp:
         if action_key == 'FIND_IMAGE':
             self.create_param_entry("path", "图像路径:", "button.png")
             self.create_param_entry("confidence", "置信度(0.1-1.0):", "0.8")
-            ttk.Label(self.param_frame, text="* 提示：如果识别失败，请尝试调低置信度 (如 0.7)", wraplength=200).pack(anchor="w", pady=5)
+            self._create_hint_label(self.param_frame, "* 提示：如果识别失败，请尝试调低置信度 (如 0.7)")
             self.create_browse_button()
             self.create_test_button("🧪 测试查找图像", self.on_test_find_image_click)
         elif action_key == 'FIND_TEXT':
             self.create_param_entry("text", "查找的文本:", "确定")
             self.create_param_combobox("lang", "语言:", list(LANG_OPTIONS.keys()))
             ocr_status = f"V{ocr_engine.ocr_engine_version}"
-            ttk.Label(self.param_frame, text=f"* OCR 引擎状态: {ocr_status}", wraplength=200).pack(anchor="w", pady=5)
+            self._create_hint_label(self.param_frame, f"* OCR 引擎: {ocr_status}")
             self.create_test_button("🧪 测试查找文本 (OCR)", self.on_test_find_text_click)
         elif action_key == 'MOVE_OFFSET':
             self.create_param_entry("x_offset", "X 偏移:", "10")
             self.create_param_entry("y_offset", "Y 偏移:", "0")
         elif action_key == 'CLICK':
             self.create_param_combobox("button", "按钮:", list(CLICK_OPTIONS.keys()))
+        
+        elif action_key == 'SCROLL':
+            self.create_param_entry("amount", "滚动量 (正数=上, 负数=下):", "100")
+            self.create_param_entry("x", "X 坐标 (可选):", "")
+            self.create_param_entry("y", "Y 坐标 (可选):", "")
+            self._create_hint_label(self.param_frame, "* 提示: 如果 X, Y 为空, \n  将在当前鼠标位置滚动。")
+
         elif action_key == 'WAIT':
             self.create_param_entry("ms", "等待 (毫秒):", "500")
         elif action_key == 'TYPE_TEXT':
             self.create_param_entry("text", "输入文本:", "你好")
-            ttk.Label(self.param_frame, text="* 此功能使用剪贴板 (Ctrl+V) \n  以支持中文及复杂文本输入。", wraplength=200).pack(anchor="w", pady=5)
+            self._create_hint_label(self.param_frame, "* 此功能使用剪贴板 (Ctrl+V) \n  以支持中文及复杂文本输入。")
         elif action_key == 'PRESS_KEY':
             self.create_param_entry("key", "按键或组合键 (如 enter, ctrl+c):", "enter")
         elif action_key == 'MOVE_TO':
             self.create_param_entry("x", "X 坐标:", "100")
             self.create_param_entry("y", "Y 坐标:", "100")
+            
+            ttk.Separator(self.param_frame, orient='horizontal').pack(fill='x', pady=(15, 5))
+            ttk.Label(self.param_frame, text="当前鼠标位置 (参考):", font=self.font_ui, foreground='gray').pack(anchor="w", pady=(5,0))
+            ttk.Label(self.param_frame, textvariable=self.mouse_pos_var, font=self.font_code, bootstyle="info").pack(anchor="w")
+            self._start_mouse_tracker()
+            
         elif action_key == 'IF_IMAGE_FOUND':
             self.create_param_entry("path", "图像路径:", "button.png")
             self.create_param_entry("confidence", "置信度:", "0.8")
@@ -248,29 +285,56 @@ class MacroApp:
 
     def create_param_entry(self, key, label_text, default_value):
         frame = ttk.Frame(self.param_frame)
-        ttk.Label(frame, text=label_text).pack(anchor="w")
-        entry = ttk.Entry(frame, width=30)
+        ttk.Label(frame, text=label_text, font=self.font_ui).pack(anchor="w")
+        entry = ttk.Entry(frame, width=30, font=self.font_ui)
         entry.insert(0, default_value)
         entry.pack(anchor="w", fill=tk.X)
-        frame.pack(fill=tk.X, pady=5)
+        frame.pack(fill=tk.X, pady=8)
         self.param_widgets[key] = entry
         
     def create_param_combobox(self, key, label_text, values):
         frame = ttk.Frame(self.param_frame)
-        ttk.Label(frame, text=label_text).pack(anchor="w")
-        combo = ttk.Combobox(frame, values=values, state="readonly", width=28)
+        ttk.Label(frame, text=label_text, font=self.font_ui).pack(anchor="w")
+        combo = ttk.Combobox(frame, values=values, state="readonly", width=28, font=self.font_ui)
         combo.current(0)
         combo.pack(anchor="w", fill=tk.X)
-        frame.pack(fill=tk.X, pady=5)
+        frame.pack(fill=tk.X, pady=8)
         self.param_widgets[key] = combo
         
     def create_browse_button(self):
-        btn = ttk.Button(self.param_frame, text="浏览...", command=self.browse_image, bootstyle="info-outline")
+        btn = ttk.Button(self.param_frame, text="浏览...", command=self.browse_image, bootstyle="info-outline", padding=(10, 6))
         btn.pack(anchor="w", fill=tk.X, pady=2)
 
     def create_test_button(self, text, command):
         ttk.Separator(self.param_frame, orient='horizontal').pack(fill='x', pady=(15, 5))
-        ttk.Button(self.param_frame, text=text, command=command, bootstyle="info").pack(anchor="w", fill=tk.X, pady=2)
+        ttk.Button(self.param_frame, text=text, command=command, bootstyle="info", padding=(10, 6)).pack(anchor="w", fill=tk.X, pady=2)
+
+    def _create_hint_label(self, parent, text):
+        label = ttk.Label(parent, text=text, wraplength=200, font=self.font_ui, foreground='gray')
+        label.pack(anchor="w", pady=5)
+        self.dynamic_wrap_labels.append(label)
+        return label
+
+    def _on_param_frame_configure(self, event):
+        width = event.width - 15 
+        if width > 0:
+            for label in self.dynamic_wrap_labels:
+                try:
+                    label.config(wraplength=width)
+                except tk.TclError:
+                    pass
+
+    def _start_mouse_tracker(self):
+        if not self.is_app_running: return
+        self._update_mouse_pos()
+        self.mouse_tracker_job = self.root.after(100, self._start_mouse_tracker)
+
+    def _update_mouse_pos(self):
+        try:
+            x, y = pyautogui.position()
+            self.mouse_pos_var.set(f"X: {x}, Y: {y}")
+        except Exception:
+            self.mouse_pos_var.set("无法获取坐标")
 
     def on_test_find_image_click(self):
         try:
@@ -341,7 +405,18 @@ class MacroApp:
         try:
             for k, w in self.param_widgets.items():
                 val = w.get()
-                if not val and action not in ['ELSE', 'END_IF', 'END_LOOP']: return
+                
+                if action == 'SCROLL' and k in ['x', 'y'] and not val:
+                    continue
+                
+                if not val:
+                    if action in ['ELSE', 'END_IF', 'END_LOOP']:
+                        continue
+                    if action == 'SCROLL' and k in ['x', 'y']:
+                        continue
+                    
+                    return
+
                 params[k] = LANG_OPTIONS.get(val, val) if k=='lang' else CLICK_OPTIONS.get(val, val) if k=='button' else val
         except: return
         
@@ -361,12 +436,14 @@ class MacroApp:
         step = self.steps[idx]
         self.action_type.set(ACTION_TRANSLATIONS.get(step['action']))
         self.update_param_fields(None)
+        
         for k, v in step['params'].items():
             if k in self.param_widgets:
                 val = LANG_VALUES_TO_NAME.get(v, v) if k=='lang' else CLICK_VALUES_TO_NAME.get(v, v) if k=='button' else v
                 w = self.param_widgets[k]
                 if isinstance(w, ttk.Combobox): w.set(val)
                 else: w.delete(0, tk.END); w.insert(0, str(val))
+        
         self.editing_index = idx
         self.add_step_btn.config(text="✓ 更新步骤", bootstyle="warning")
         self.add_step_btn.grid_configure(columnspan=1)
@@ -395,8 +472,11 @@ class MacroApp:
                  cache_str = f" [Cache: {box[0]}, {box[1]}]"
 
             prefix = "[编辑] -> " if i == self.editing_index else f"步骤 {i+1}: "
+            
+            action_label = ACTION_TRANSLATIONS.get(act, act)
+            
             param_str = f"| {display_params}" if display_params else ""
-            display_texts.append(f"{indent_str}{prefix}{ACTION_TRANSLATIONS.get(act, act)} {param_str}{cache_str}")
+            display_texts.append(f"{indent_str}{prefix}{action_label} {param_str}{cache_str}")
             
             if act.startswith('IF_') or act == 'LOOP_START': block_stack.append(act)
             elif act in ['END_IF', 'END_LOOP'] and block_stack: block_stack.pop()
@@ -583,6 +663,7 @@ class MacroApp:
 
     def change_theme(self):
         self.root.style.theme_use(self.current_theme.get())
+        self.root.style.configure(".", font=self.font_ui)
         self.save_app_settings()
 
 if __name__ == "__main__":

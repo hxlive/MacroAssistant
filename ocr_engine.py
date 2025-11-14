@@ -1,7 +1,7 @@
 # ocr_engine.py
 # 描述：自动化宏的 OCR 功能引擎
-# 版本：1.46.5
-# 变更：修复 RapidOCR 新版返回对象不可迭代的 Bug；新增引擎静默预热功能
+# 版本：1.49.1
+# 变更：版本号同步
 
 from PIL import Image, ImageGrab
 import re
@@ -145,10 +145,7 @@ def find_text_location(target_text, lang='eng', debug=False, screenshot_pil=None
     img_bgr_cache = None 
     def get_img_bgr():
         nonlocal img_bgr_cache
-        if img_bgr_cache is None: 
-           import cv2
-           import numpy as np
-           img_bgr_cache = cv2.cvtColor(np.array(screenshot_pil), cv2.COLOR_RGB2BGR)
+        if img_bgr_cache is None: img_bgr_cache = cv2.cvtColor(np.array(screenshot_pil), cv2.COLOR_RGB2BGR)
         return img_bgr_cache
 
     if engine == 'auto':
@@ -234,28 +231,25 @@ def _find_text_winocr(winocr_module, target_norm, lang_code, debug, screenshot_p
 
 def _find_text_rapidocr_internal(inst, target_norm, debug, img_bgr, offset):
     try:
-        import numpy as np
         res = inst(img_bgr)
         all_boxes, all_texts, all_scores = [], [], []
         
-        # 【修复】兼容 RapidOCR 新旧版本返回格式
-        if isinstance(res, tuple): # 旧版 (result, elapse)
+        if isinstance(res, tuple):
             res_list = res[0]
             if res_list:
                 for item in res_list:
                     if len(item) >= 2:
                         all_boxes.append(item[0]); all_texts.append(item[1])
                         all_scores.append(item[2] if len(item)>2 else 0.0)
-        elif isinstance(res, list): # 纯列表返回
+        elif isinstance(res, list):
              for item in res:
                 if len(item) >= 2:
                     all_boxes.append(item[0]); all_texts.append(item[1])
                     all_scores.append(item[2] if len(item)>2 else 0.0)
-        else: # 新版对象返回，使用 getattr 安全获取
+        else:
             all_boxes = getattr(res, 'boxes', [])
             all_texts = getattr(res, 'txts', [])
             all_scores = getattr(res, 'scores', [])
-            # 如果属性也是 None，尝试其他可能的属性名 (如 dt_boxes, rec_res)
             if all_boxes is None: all_boxes = getattr(res, 'dt_boxes', [])
             if all_texts is None:
                  rec_res = getattr(res, 'rec_res', [])
@@ -266,7 +260,6 @@ def _find_text_rapidocr_internal(inst, target_norm, debug, img_bgr, offset):
 
         words = []
         for box, text, score in zip(all_boxes, all_texts, all_scores):
-            # 确保 box 是列表格式
             if not isinstance(box, (list, np.ndarray)): continue
             xs = [p[0] for p in box]; ys = [p[1] for p in box]
             words.append({'text': re.sub(r'\s+','',text).lower(), 'box': [min(xs), min(ys), max(xs), max(ys)], 'score': score})
@@ -297,8 +290,6 @@ def _find_text_tesseract(target_norm, lang, debug, screenshot_pil, offset):
         import pytesseract
         if _TESSERACT_CMD: pytesseract.pytesseract.tesseract_cmd = _TESSERACT_CMD
         if NUMPY_CV2_AVAILABLE:
-            import cv2
-            import numpy as np
             gray = cv2.cvtColor(np.array(screenshot_pil), cv2.COLOR_RGB2GRAY)
             h, w = gray.shape[:2]; s = 2
             scaled = cv2.resize(gray, (w*s, h*s), interpolation=cv2.INTER_CUBIC)
@@ -333,4 +324,4 @@ def _find_text_tesseract(target_norm, lang, debug, screenshot_pil, offset):
         return None
     except Exception as e: return None
 
-ocr_engine_version = "1.46.6"
+ocr_engine_version = "1.49.1"

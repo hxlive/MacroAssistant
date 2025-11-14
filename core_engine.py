@@ -1,6 +1,6 @@
 # core_engine.py
 # 描述：自动化宏的核心功能引擎
-# 版本：1.46.5
+# 版本：1.49.1
 
 import pyautogui
 import time
@@ -147,7 +147,7 @@ def quick_check_cv2(path, conf, screenshot_pil, offset, target_loc):
 # 主执行引擎
 # ======================================================================
 def execute_steps(steps, run_context=None, status_callback=None):
-    print(f"\n--- 宏执行开始 (Core V1.46.5) ---")
+    print(f"\n--- 宏执行开始 (Core V1.49.1) ---")
     perf.reset(); loop_cache.reset()
     ctx = run_context if run_context else {}
     ctx.setdefault('last_pos', (None, None))
@@ -310,4 +310,4 @@ def _find_jump(steps, start, open_tag, close_tag, targets):
         elif lvl == 0 and a in targets: return i + 1
     return len(steps)
 
-macro_engine_version = f"1.46.5 (Core) / OpenCV: {OPENCV_AVAILABLE}"
+macro_engine_version = f"1.49.1 (Core) / OpenCV: {OPENCV_AVAILABLE}"
