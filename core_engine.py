@@ -1,6 +1,9 @@
+# -*- coding: utf-8 -*-
 # core_engine.py
 # 描述：自动化宏的核心功能引擎
-# 版本：1.49.1
+# 版本：1.53.2
+# 变更：(修复#A) 移除了 LoopCacheManager 中未被使用的 next_iteration 方法和调用。
+#       (修复#C) 添加了 UTF-8 编码声明。
 
 import pyautogui
 import time
@@ -12,10 +15,18 @@ import sys
 from collections import defaultdict
 import functools 
 
+try:
+    import pygetwindow as gw
+    PYGETWINDOW_AVAILABLE = True
+except ImportError:
+    PYGETWINDOW_AVAILABLE = False
+    print("[配置] ✗ 未找到 pygetwindow 库 (pip install pygetwindow)。'激活窗口' 功能将不可用。")
+
 # ======================================================================
 # 全局配置
 # ======================================================================
-FORCE_OCR_ENGINE = None
+FORCE_OCR_ENGINE = None 
+ENABLE_GLOBAL_FALLBACK = True # 控制是否启用缓存失效后的全局搜索
 
 # 导入 OCR 引擎
 try:
@@ -28,7 +39,7 @@ except ImportError:
         TESSERACT_AVAILABLE = False
         RAPIDOCR_AVAILABLE = False
 
-# 导入 OpenCV (用于高速找图)
+# 导入 OpenCV
 try:
     import cv2
     import numpy as np 
@@ -37,6 +48,89 @@ try:
 except ImportError:
     OPENCV_AVAILABLE = False
     print("[配置] ✗ 未找到 OpenCV。将回退到慢速找图模式。")
+
+# ======================================================================
+# 快捷键工具模块
+# ======================================================================
+class HotkeyUtils:
+    """快捷键解析、验证工具类"""
+    
+    PYNPUT_TO_VK = {
+        'f1': 0x70, 'f2': 0x71, 'f3': 0x72, 'f4': 0x73, 'f5': 0x74, 'f6': 0x75,
+        'f7': 0x76, 'f8': 0x77, 'f9': 0x78, 'f10': 0x79, 'f11': 0x7A, 'f12': 0x7B,
+        'a': 0x41, 'b': 0x42, 'c': 0x43, 'd': 0x44, 'e': 0x45, 'f': 0x46, 'g': 0x47,
+        'h': 0x48, 'i': 0x49, 'j': 0x4A, 'k': 0x4B, 'l': 0x4C, 'm': 0x4D, 'n': 0x4E,
+        'o': 0x4F, 'p': 0x50, 'q': 0x51, 'r': 0x52, 's': 0x53, 't': 0x54, 'u': 0x55,
+        'v': 0x56, 'w': 0x57, 'x': 0x58, 'y': 0x59, 'z': 0x5A,
+        '0': 0x30, '1': 0x31, '2': 0x32, '3': 0x33, '4': 0x34, '5': 0x35, '6': 0x36,
+        '7': 0x37, '8': 0x38, '9': 0x39,
+        'enter': 0x0D, 'space': 0x20, 'tab': 0x09, 'caps_lock': 0x14,
+        'esc': 0x1B, 'page_up': 0x21, 'page_down': 0x22, 'end': 0x23, 'home': 0x24,
+        'left': 0x25, 'up': 0x26, 'right': 0x27, 'down': 0x28, 'insert': 0x2D, 'delete': 0x2E,
+        'backspace': 0x08,
+    }
+    VK_TO_PYNPUT = {v: k for k, v in PYNPUT_TO_VK.items()}
+    
+    try:
+        if sys.platform == 'win32':
+            import win32con
+            PYNPUT_MOD_TO_WIN_MOD = {
+                'ctrl': win32con.MOD_CONTROL, 'alt': win32con.MOD_ALT,
+                'shift': win32con.MOD_SHIFT, 'cmd': win32con.MOD_WIN,
+            }
+        else:
+            PYNPUT_MOD_TO_WIN_MOD = {}
+    except ImportError:
+        PYNPUT_MOD_TO_WIN_MOD = {}
+    
+    @staticmethod
+    def format_hotkey_display(hotkey_str):
+        """格式化快捷键显示 (ctrl+f10 -> Ctrl+F10)"""
+        if not hotkey_str or "录制" in hotkey_str:
+            return hotkey_str
+        try:
+            parts = hotkey_str.split('+')
+            display_parts = []
+            for part in parts:
+                if part.lower() in {'ctrl', 'alt', 'shift', 'cmd'}:
+                    display_parts.append(part.capitalize())
+                else:
+                    display_parts.append(part.upper())
+            return "+".join(display_parts)
+        except:
+            return hotkey_str.upper()
+
+# ======================================================================
+# 宏定义元数据
+# ======================================================================
+class MacroSchema:
+    """宏系统的元数据定义"""
+    
+    ACTION_TRANSLATIONS = {
+        'FIND_IMAGE':     '01. 查找图像',
+        'FIND_TEXT':      '02. 查找文本 (OCR)',
+        'MOVE_OFFSET':    '03. 相对移动',
+        'MOVE_TO':        '04. 移动到 (绝对坐标)',
+        'CLICK':          '05. 点击鼠标',
+        'SCROLL':         '06. 滚动滚轮',
+        'WAIT':           '07. 等待',
+        'TYPE_TEXT':      '08. 输入文本',
+        'PRESS_KEY':      '09. 按下按键',
+        'ACTIVATE_WINDOW':'10. 激活窗口 (按标题)',
+        'IF_IMAGE_FOUND': '11. IF 找到图像',
+        'IF_TEXT_FOUND':  '12. IF 找到文本',
+        'ELSE':           '13. ELSE',
+        'END_IF':         '14. END_IF',
+        'LOOP_START':     '15. 循环开始 (Loop)',
+        'END_LOOP':       '16. 结束循环 (EndLoop)',
+    }
+    ACTION_KEYS_TO_NAME = {v: k for k, v in ACTION_TRANSLATIONS.items()}
+    
+    LANG_OPTIONS = {'chi_sim (简体中文)': 'chi_sim', 'eng (英文)': 'eng'}
+    LANG_VALUES_TO_NAME = {v: k for k, v in LANG_OPTIONS.items()}
+    
+    CLICK_OPTIONS = {'left (左键)': 'left', 'right (右键)': 'right', 'middle (中键)': 'middle'}
+    CLICK_VALUES_TO_NAME = {v: k for k, v in CLICK_OPTIONS.items()}
 
 # ======================================================================
 # 性能监控
@@ -69,20 +163,44 @@ perf = PerformanceMonitor()
 # ======================================================================
 class LoopCacheManager:
     def __init__(self): self.reset()
+    
     def reset(self):
-        self.caches = {}; self.cur_loop = None; self.loop_iteration = 0
+        """清空所有缓存和循环堆栈"""
+        self.caches = {}
+        self.stack = [] # 使用堆栈来管理嵌套循环
+        
+    def get_current_loop_id(self):
+        """获取当前 (最内层) 循环的ID"""
+        return self.stack[-1] if self.stack else None
+
     def enter(self, loop_id):
-        self.cur_loop = loop_id; self.loop_iteration = 0
-        if loop_id not in self.caches: self.caches[loop_id] = {}
-    def next_iteration(self): self.loop_iteration += 1
+        """进入一个新循环 (压栈)"""
+        if loop_id not in self.caches:
+            self.caches[loop_id] = {}
+        self.stack.append(loop_id)
+
     def exit(self):
-        if self.cur_loop in self.caches: del self.caches[self.cur_loop]
-        self.cur_loop = None; self.loop_iteration = 0
-    def get(self, sig): return self.caches.get(self.cur_loop, {}).get(sig) if self.cur_loop else None
+        """退出一个循环 (弹栈)"""
+        if self.stack:
+            self.stack.pop()
+
+    def clear_cache(self, loop_id):
+        """显式清除指定循环的缓存 (当循环结束时)"""
+        if loop_id in self.caches:
+            del self.caches[loop_id]
+
+    def get(self, sig): 
+        """从当前循环获取缓存"""
+        loop_id = self.get_current_loop_id()
+        return self.caches.get(loop_id, {}).get(sig) if loop_id else None
+
     def set(self, sig, loc): 
-        if self.cur_loop: 
-            if self.cur_loop not in self.caches: self.caches[self.cur_loop] = {}
-            self.caches[self.cur_loop][sig] = loc
+        """向当前循环设置缓存"""
+        loop_id = self.get_current_loop_id()
+        if loop_id:
+            if loop_id not in self.caches:
+                 self.caches[loop_id] = {}
+            self.caches[loop_id][sig] = loc
 
 loop_cache = LoopCacheManager()
 
@@ -147,17 +265,25 @@ def quick_check_cv2(path, conf, screenshot_pil, offset, target_loc):
 # 主执行引擎
 # ======================================================================
 def execute_steps(steps, run_context=None, status_callback=None):
-    print(f"\n--- 宏执行开始 (Core V1.49.1) ---")
+    print(f"\n--- 宏执行开始 (Core V1.53.2) ---")
     perf.reset(); loop_cache.reset()
     ctx = run_context if run_context else {}
     ctx.setdefault('last_pos', (None, None))
     ctx.setdefault('stop_requested', False)
     
+    default_stop = "Ctrl+F11"
+    try:
+        s = run_context.get('stop_key_str', default_stop)
+        stop_key_display = HotkeyUtils.format_hotkey_display(s)
+    except:
+        stop_key_display = default_stop
+    
     pc, loops = 0, []
     try:
         while pc < len(steps):
             if ctx.get('stop_requested', False): 
-                print("  [停止] 用户请求停止 (Ctrl+F11)"); break
+                print(f"  [停止] 用户请求停止 ({stop_key_display})")
+                break
                 
             step = steps[pc]; act = step.get('action',''); p = step.get('params',{})
             print(f"[{pc+1}] {act}")
@@ -165,7 +291,7 @@ def execute_steps(steps, run_context=None, status_callback=None):
 
             try:
                 if act.startswith('FIND_') or act.startswith('IF_'):
-                    res = _handle_find(act, p, ctx, loop_cache.cur_loop is not None)
+                    res = _handle_find(act, p, ctx, loop_cache.get_current_loop_id() is not None)
                     if act.startswith('IF_'):
                         if not res:
                             print("  -> IF条件不满足，跳过")
@@ -210,16 +336,39 @@ def execute_steps(steps, run_context=None, status_callback=None):
                     keys = p.get('key', '').lower().replace(' ', '').split('+')
                     if keys: pyautogui.hotkey(*keys)
                 
+                elif act == 'ACTIVATE_WINDOW':
+                    if not PYGETWINDOW_AVAILABLE:
+                        print("  [错误] pygetwindow 库未安装，无法激活窗口。")
+                        break
+                    title = p.get('title')
+                    if not title:
+                        print("  [错误] 未提供窗口标题。")
+                        break
+                    
+                    try:
+                        wins = gw.getWindowsWithTitle(title)
+                        if not wins:
+                            print(f"  [失败] 未找到标题包含 '{title}' 的窗口。")
+                            break
+                        
+                        target_win = wins[0]
+                        if target_win.isMinimized:
+                            target_win.restore()
+                        target_win.activate()
+                        print(f"  [成功] 已激活窗口: {target_win.title}")
+                        time.sleep(0.5) 
+                    except Exception as e:
+                        print(f"  [错误] 激活窗口时出错: {e}")
+                        break
+
                 elif act == 'ELSE': 
                     next_pc = _find_jump(steps, pc, 'IF_', 'END_IF', ['END_IF'])
                 
                 elif act == 'LOOP_START':
-                    next_pc, is_looping = _handle_loop_start(steps, pc, loops, p, ctx, status_callback)
-                    if not is_looping: loop_cache.exit() 
+                    next_pc = _handle_loop_start(steps, pc, loops, p, ctx, status_callback)
                 
                 elif act == 'END_LOOP': 
-                    loop_cache.next_iteration()
-                    next_pc = loops[-1]['start']
+                    next_pc = loops[-1]['start'] # 返回循环开始处
 
             except Exception as e:
                 print(f"  [执行异常] {e}"); import traceback; traceback.print_exc(); break
@@ -252,7 +401,7 @@ def _handle_find(act, p, ctx, in_loop):
 
     res = _do_find(is_img, p, ss, offset, final_engine)
     
-    if not res and region:
+    if not res and region and ENABLE_GLOBAL_FALLBACK:
         print("  [缓存失效] 全局搜索...")
         ss, offset = smart_screenshot(None)
         res = _do_find(is_img, p, ss, offset, final_engine)
@@ -288,16 +437,22 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
         top['remain'] -= 1
         if top['remain'] > 0:
             if cb: cb(f"循环剩余: {top['remain']}")
-            return pc + 1, True
+            return pc + 1
         else:
-            loops.pop()
-            return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP']), False
+            loop_id_to_exit = loops.pop()['id']
+            loop_cache.exit() # 弹栈
+            loop_cache.clear_cache(loop_id_to_exit) # 清理缓存
+            return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
     else:
         count = int(p.get('times', 1))
-        if count <= 0: return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP']), False
-        loops.append({'start': pc, 'remain': count})
-        loop_cache.enter(f"L{pc}")
-        return pc + 1, True
+        if count <= 0: 
+            return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
+        
+        loop_id = f"L{pc}_{len(loops)}" 
+        loops.append({'start': pc, 'remain': count, 'id': loop_id})
+        loop_cache.enter(loop_id) # 压栈
+        if cb: cb(f"循环剩余: {count}")
+        return pc + 1
 
 def _find_jump(steps, start, open_tag, close_tag, targets):
     lvl = 0
@@ -310,4 +465,4 @@ def _find_jump(steps, start, open_tag, close_tag, targets):
         elif lvl == 0 and a in targets: return i + 1
     return len(steps)
 
-macro_engine_version = f"1.49.1 (Core) / OpenCV: {OPENCV_AVAILABLE}"
+core_engine_version = f"1.53.2 (Core) / OpenCV: {OPENCV_AVAILABLE}"

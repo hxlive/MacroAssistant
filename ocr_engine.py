@@ -1,7 +1,9 @@
+# -*- coding: utf-8 -*-
 # ocr_engine.py
 # 描述：自动化宏的 OCR 功能引擎
-# 版本：1.49.1
-# 变更：版本号同步
+# 版本：1.52.1
+# 变更：(修复#3) 增加 RapidOCR 解析的类型检查，提高健壮性。
+#       (修复#13) 添加 get_available_engines() 函数，用于GUI健康检查。
 
 from PIL import Image, ImageGrab
 import re
@@ -25,14 +27,14 @@ try:
     from rapidocr import RapidOCR
     RAPIDOCR_CLASS = RapidOCR 
 except Exception as e:
-    pass # 预加载失败不打印，等到真正使用时再报错
+    pass 
 
 # ======================================================================
 # 全局状态缓存
 # ======================================================================
 _RAPID_OCR_INSTANCE = None
 _RAPID_OCR_INIT_FAILED = False
-_RAPID_OCR_LOCK = threading.Lock() # 确保预热线程安全
+_RAPID_OCR_LOCK = threading.Lock() 
 
 _TESSERACT_CMD = None
 _TESSERACT_TESSDATA = None
@@ -48,14 +50,13 @@ def preload_engines():
     if NUMPY_CV2_AVAILABLE:
         get_rapid_ocr_engine()
     get_tesseract_cmd()
-    # WinOCR 不需要预热
 
 def get_rapid_ocr_engine():
     global _RAPID_OCR_INSTANCE, _RAPID_OCR_INIT_FAILED
     if _RAPID_OCR_INSTANCE: return _RAPID_OCR_INSTANCE
     if _RAPID_OCR_INIT_FAILED or not RAPIDOCR_CLASS: return None
     
-    with _RAPID_OCR_LOCK: # 加锁防止多线程同时初始化
+    with _RAPID_OCR_LOCK: 
         if _RAPID_OCR_INSTANCE: return _RAPID_OCR_INSTANCE
         try:
             print("[OCR] 正在加载 RapidOCR 模型...")
@@ -88,7 +89,8 @@ def get_tesseract_cmd():
             if os.path.exists(exe):
                 _TESSERACT_CMD = exe
                 data = os.path.join(root, 'tesseract_local', 'tessdata')
-                if os.path.exists(data): _TESSERACT_TESSDATA = data
+                if os.path.exists(data):
+                    _TESSERACT_TESSDATA = os.path.abspath(data)
                 break
         
         if not _TESSERACT_CMD:
@@ -103,7 +105,6 @@ def get_tesseract_cmd():
             try:
                 import pytesseract
                 pytesseract.pytesseract.tesseract_cmd = _TESSERACT_CMD
-                # print(f"[OCR] Tesseract 就绪")
             except: _TESSERACT_CMD = None
             
         return _TESSERACT_CMD
@@ -238,12 +239,14 @@ def _find_text_rapidocr_internal(inst, target_norm, debug, img_bgr, offset):
             res_list = res[0]
             if res_list:
                 for item in res_list:
-                    if len(item) >= 2:
+                    # <--- (新修复 #3) 增加类型检查
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
                         all_boxes.append(item[0]); all_texts.append(item[1])
                         all_scores.append(item[2] if len(item)>2 else 0.0)
         elif isinstance(res, list):
              for item in res:
-                if len(item) >= 2:
+                # <--- (新修复 #3) 增加类型检查
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
                     all_boxes.append(item[0]); all_texts.append(item[1])
                     all_scores.append(item[2] if len(item)>2 else 0.0)
         else:
@@ -289,39 +292,87 @@ def _find_text_tesseract(target_norm, lang, debug, screenshot_pil, offset):
     try:
         import pytesseract
         if _TESSERACT_CMD: pytesseract.pytesseract.tesseract_cmd = _TESSERACT_CMD
+        
+        s = 2 
         if NUMPY_CV2_AVAILABLE:
             gray = cv2.cvtColor(np.array(screenshot_pil), cv2.COLOR_RGB2GRAY)
-            h, w = gray.shape[:2]; s = 2
+            h, w = gray.shape[:2]
             scaled = cv2.resize(gray, (w*s, h*s), interpolation=cv2.INTER_CUBIC)
             bw = cv2.adaptiveThreshold(scaled, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
             img_processed = Image.fromarray(bw)
         else:
-            s = 2; g = screenshot_pil.convert('L')
+            g = screenshot_pil.convert('L')
             img_processed = g.resize((g.size[0]*s, g.size[1]*s), resample=Image.LANCZOS)
+        
         config = f'-l {lang}'
-        if _TESSERACT_TESSDATA: config += f' --tessdata-dir "{_TESSERACT_TESSDATA}"'
+        if _TESSERACT_TESSDATA: 
+            config += f' --tessdata-dir {_TESSERACT_TESSDATA}'
+        
         for psm in [6, 11, 3]:
             data = pytesseract.image_to_data(img_processed, config=config + f' --psm {psm}', output_type=pytesseract.Output.DICT)
             words = []
+            
             for i in range(len(data['text'])):
                 if int(data['conf'][i]) > 30 and data['text'][i].strip():
-                    words.append({'text': re.sub(r'\s+','',data['text'][i]).lower(), 'box': [data['left'][i]//s, data['top'][i]//s, (data['left'][i]+data['width'][i])//s, (data['top'][i]+data['height'][i])//s]})
+                    words.append({
+                        'text': re.sub(r'\s+','',data['text'][i]).lower(),
+                        'box': [data['left'][i]//s, data['top'][i]//s, (data['left'][i]+data['width'][i])//s, (data['top'][i]+data['height'][i])//s]
+                    })
+            
+            if debug: print(f"  [Tesseract] PSM {psm} 识别 {len(words)} 词")
+
             for w in words:
                 if target_norm in w['text']:
-                    b = w['box']; cx, cy = offset[0]+(b[0]+b[2])//2, offset[1]+(b[1]+b[3])//2
-                    if debug: print(f"  [Tesseract✓] ({cx}, {cy})")
+                    b = w['box'] 
+                    cx, cy = offset[0]+(b[0]+b[2])//2, offset[1]+(b[1]+b[3])//2
+                    if debug: print(f"  [Tesseract✓] (PSM {psm}) ({cx}, {cy})")
                     return (cx, cy)
+            
             for i in range(len(words)):
-                if not target_norm.startswith(words[i]['text']): continue
-                m = words[i]['text']; b_list = [words[i]['box']]
+                merged = words[i]['text']
+                if not target_norm.startswith(merged): continue
+                b_list = [words[i]['box']]
                 for j in range(i+1, min(i+5, len(words))):
-                    m += words[j]['text']; b_list.append(words[j]['box'])
-                    if target_norm == m:
-                        ax = sum((b[0]+b[2])//2 for b in b_list)//len(b_list)
-                        ay = sum((b[1]+b[3])//2 for b in b_list)//len(b_list)
-                        print(f"  [Tesseract✓] 合并{len(b_list)}词 ({offset[0]+ax}, {offset[1]+ay})")
-                        return (offset[0]+ax, offset[1]+ay)
+                    merged += words[j]['text']; b_list.append(words[j]['box'])
+                    if target_norm == merged:
+                        cx = offset[0] + sum((b[0]+b[2])//2 for b in b_list)//len(b_list)
+                        cy = offset[1] + sum((b[1]+b[3])//2 for b in b_list)//len(b_list)
+                        if debug: print(f"  [Tesseract✓] (PSM {psm}) 合并 ({cx}, {cy})")
+                        return (cx, cy)
+                        
         return None
-    except Exception as e: return None
+    except Exception as e: 
+        if debug: print(f"[Tesseract Error] {e}")
+        return None
 
-ocr_engine_version = "1.49.1"
+def get_available_engines():
+    """
+    检查所有可用的 OCR 引擎。
+    返回: 一个元组列表 [(engine_key, friendly_name), ...]
+    """
+    engines = []
+    
+    # 1. WinOCR (Windows 10/11 Only)
+    try:
+        import winocr
+        if 'eng' in LANG_MAP['winocr']:
+             engines.append(('winocr', 'Windows 10/11 OCR'))
+    except ImportError:
+        pass
+
+    # 2. RapidOCR (if installed)
+    # get_rapid_ocr_engine() 会触发懒加载
+    if get_rapid_ocr_engine() and 'eng' in LANG_MAP['rapidocr']:
+        engines.append(('rapidocr', 'RapidOCR (推荐)'))
+
+    # 3. Tesseract (if installed)
+    # get_tesseract_cmd() 会触发懒加载
+    if get_tesseract_cmd() and 'eng' in LANG_MAP['tesseract']:
+        engines.append(('tesseract', 'Tesseract OCR'))
+    
+    if not engines:
+        engines.append(('none', '无可用OCR引擎'))
+        
+    return engines
+
+ocr_engine_version = "1.52.2"
