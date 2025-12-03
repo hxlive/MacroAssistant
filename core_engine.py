@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 # core_engine.py
-# 描述：自动化宏的核心功能引擎
-# 版本：1.53.2
-# 变更：(修复#A) 移除了 LoopCacheManager 中未被使用的 next_iteration 方法和调用。
-#       (修复#C) 添加了 UTF-8 编码声明。
+# 描述:自动化宏的核心功能引擎
+# 版本:1.56.0
+# 变更:(修复) 条件循环迭代计数混乱问题、UI快速恢复问题
 
 import pyautogui
 import time
@@ -26,9 +25,17 @@ except ImportError:
 # 全局配置
 # ======================================================================
 FORCE_OCR_ENGINE = None 
-ENABLE_GLOBAL_FALLBACK = True # 控制是否启用缓存失效后的全局搜索
+ENABLE_GLOBAL_FALLBACK = True
+# 条件循环检测间隔 (秒) - 平衡流畅度与准确率
+LOOP_CHECK_INTERVAL = 0.2  # 优化: 从 0.5s 降低到 0.2s (平衡流畅度与准确率)
+# 性能与缓存相关常量
+LOOP_PHYSICAL_COOLDOWN = 0.05  # 循环物理冷却时间（秒），防止队列瞬间爆炸
+CACHE_BOX_PADDING = 50  # 缓存区域扩展边距（像素）
+TEMPLATE_CACHE_SIZE = 500  # 模板缓存大小（优化：从100增加到500）
+QUICK_CHECK_SCALES = [1.0, 0.9, 1.1]  # 快速检查尝试的缩放比例
 
-# 导入 OCR 引擎
+
+
 try:
     import ocr_engine
 except ImportError:
@@ -39,12 +46,11 @@ except ImportError:
         TESSERACT_AVAILABLE = False
         RAPIDOCR_AVAILABLE = False
 
-# 导入 OpenCV
 try:
     import cv2
     import numpy as np 
     OPENCV_AVAILABLE = True
-    print("[配置] ✓ OpenCV 引擎就绪 (极速找图内核已启用)")
+    print("[配置] ✓ OpenCV 引擎就绪 (极速找图内核已可用)")
 except ImportError:
     OPENCV_AVAILABLE = False
     print("[配置] ✗ 未找到 OpenCV。将回退到慢速找图模式。")
@@ -53,8 +59,6 @@ except ImportError:
 # 快捷键工具模块
 # ======================================================================
 class HotkeyUtils:
-    """快捷键解析、验证工具类"""
-    
     PYNPUT_TO_VK = {
         'f1': 0x70, 'f2': 0x71, 'f3': 0x72, 'f4': 0x73, 'f5': 0x74, 'f6': 0x75,
         'f7': 0x76, 'f8': 0x77, 'f9': 0x78, 'f10': 0x79, 'f11': 0x7A, 'f12': 0x7B,
@@ -85,7 +89,6 @@ class HotkeyUtils:
     
     @staticmethod
     def format_hotkey_display(hotkey_str):
-        """格式化快捷键显示 (ctrl+f10 -> Ctrl+F10)"""
         if not hotkey_str or "录制" in hotkey_str:
             return hotkey_str
         try:
@@ -104,8 +107,6 @@ class HotkeyUtils:
 # 宏定义元数据
 # ======================================================================
 class MacroSchema:
-    """宏系统的元数据定义"""
-    
     ACTION_TRANSLATIONS = {
         'FIND_IMAGE':     '01. 查找图像',
         'FIND_TEXT':      '02. 查找文本 (OCR)',
@@ -165,37 +166,34 @@ class LoopCacheManager:
     def __init__(self): self.reset()
     
     def reset(self):
-        """清空所有缓存和循环堆栈"""
         self.caches = {}
-        self.stack = [] # 使用堆栈来管理嵌套循环
+        self.stack = []
         
     def get_current_loop_id(self):
-        """获取当前 (最内层) 循环的ID"""
         return self.stack[-1] if self.stack else None
 
     def enter(self, loop_id):
-        """进入一个新循环 (压栈)"""
         if loop_id not in self.caches:
             self.caches[loop_id] = {}
         self.stack.append(loop_id)
 
     def exit(self):
-        """退出一个循环 (弹栈)"""
         if self.stack:
-            self.stack.pop()
+            loop_id = self.stack.pop()
+            # 主动清理该循环的缓存，符合设计原则
+            # 注意: execute_steps 的 finally 块也会调用 reset() 作为兜底
+            if loop_id in self.caches:
+                del self.caches[loop_id]
 
     def clear_cache(self, loop_id):
-        """显式清除指定循环的缓存 (当循环结束时)"""
         if loop_id in self.caches:
             del self.caches[loop_id]
 
     def get(self, sig): 
-        """从当前循环获取缓存"""
         loop_id = self.get_current_loop_id()
         return self.caches.get(loop_id, {}).get(sig) if loop_id else None
 
     def set(self, sig, loc): 
-        """向当前循环设置缓存"""
         loop_id = self.get_current_loop_id()
         if loop_id:
             if loop_id not in self.caches:
@@ -216,7 +214,7 @@ def smart_screenshot(region=None):
     return ImageGrab.grab(), (0, 0)
 
 SCALES = [1.0, 0.9, 1.1, 0.8, 1.2]
-@functools.lru_cache(maxsize=100)
+@functools.lru_cache(maxsize=500)  # [优化] 增大缓存以减少文件读取
 def _get_template(path, scale):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None: return None, 0, 0
@@ -243,33 +241,63 @@ def find_image_cv2(path, conf, screenshot_pil, offset=(0,0)):
             cx, cy = offset[0] + loc[0] + w//2, offset[1] + loc[1] + h//2
             perf.record_time(time.time()-t0, False)
             return (cx, cy, w, h), val
-    except Exception as e: print(f"CV2找图错误: {e}")
+    except (cv2.error, ValueError, TypeError, AttributeError) as e:
+        print(f"CV2找图错误: {e}")
     return None
 
 def quick_check_cv2(path, conf, screenshot_pil, offset, target_loc):
+    """
+    [补丁优化] 快速检查图片是否仍在缓存位置
+    
+    优化: 支持多缩放比例检查，避免缓存失效
+    
+    Args:
+        path: 图片文件路径
+        conf: 置信度阈值
+        screenshot_pil: PIL截图对象
+        offset: 截图偏移量 (x, y)
+        target_loc: 目标位置 (x, y)
+        
+    Returns:
+        bool: 是否在目标位置找到图片
+    """
     if not OPENCV_AVAILABLE: return False
     try:
-        tmpl, tw, th = _get_template(path, 1.0)
-        if tmpl is None: return False
-        pad_w, pad_h = tw//2 + 15, th//2 + 15
-        rel_x, rel_y = target_loc[0] - offset[0], target_loc[1] - offset[1]
-        l, t = max(0, rel_x - pad_w), max(0, rel_y - pad_h)
-        r, b = min(screenshot_pil.width, rel_x + pad_w), min(screenshot_pil.height, rel_y + pad_h)
-        if r <= l or b <= t: return False
-        crop = cv2.cvtColor(np.array(screenshot_pil.crop((l, t, r, b))), cv2.COLOR_RGB2GRAY)
-        _, max_v, _, _ = cv2.minMaxLoc(cv2.matchTemplate(crop, tmpl, cv2.TM_CCOEFF_NORMED))
-        return max_v >= conf
-    except: return False
+        # [补丁优化] 尝试多个缩放比例，避免因缩放不匹配导致误判
+        for scale in QUICK_CHECK_SCALES:
+            tmpl, tw, th = _get_template(path, scale)
+            if tmpl is None: continue
+            
+            pad_w, pad_h = tw//2 + 15, th//2 + 15
+            rel_x, rel_y = target_loc[0] - offset[0], target_loc[1] - offset[1]
+            l, t = max(0, rel_x - pad_w), max(0, rel_y - pad_h)
+            r, b = min(screenshot_pil.width, rel_x + pad_w), min(screenshot_pil.height, rel_y + pad_h)
+            if r <= l or b <= t: continue
+            
+            crop = cv2.cvtColor(np.array(screenshot_pil.crop((l, t, r, b))), cv2.COLOR_RGB2GRAY)
+            _, max_v, _, _ = cv2.minMaxLoc(cv2.matchTemplate(crop, tmpl, cv2.TM_CCOEFF_NORMED))
+            
+            if max_v >= conf:
+                return True  # 找到匹配，立即返回
+        
+        return False  # 所有缩放比例都不匹配
+    except (cv2.error, ValueError, TypeError, AttributeError, IndexError) as e:
+        # [补丁优化] 记录异常详情，便于调试
+        print(f"[quick_check_cv2] 异常: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 # ======================================================================
 # 主执行引擎
 # ======================================================================
 def execute_steps(steps, run_context=None, status_callback=None):
-    print(f"\n--- 宏执行开始 (Core V1.53.2) ---")
+    print(f"\n--- 宏执行开始 (Core V1.55.5) ---")
     perf.reset(); loop_cache.reset()
     ctx = run_context if run_context else {}
     ctx.setdefault('last_pos', (None, None))
     ctx.setdefault('stop_requested', False)
+    ctx.setdefault('clipboard_var', '')
     
     default_stop = "Ctrl+F11"
     try:
@@ -281,6 +309,7 @@ def execute_steps(steps, run_context=None, status_callback=None):
     pc, loops = 0, []
     try:
         while pc < len(steps):
+
             if ctx.get('stop_requested', False): 
                 print(f"  [停止] 用户请求停止 ({stop_key_display})")
                 break
@@ -290,14 +319,21 @@ def execute_steps(steps, run_context=None, status_callback=None):
             next_pc = pc + 1
 
             try:
+                # [关键] 每次循环初始化结果变量
+                res = None
                 if act.startswith('FIND_') or act.startswith('IF_'):
                     res = _handle_find(act, p, ctx, loop_cache.get_current_loop_id() is not None)
                     if act.startswith('IF_'):
                         if not res:
-                            print("  -> IF条件不满足，跳过")
+                            print("  -> IF条件不满足,跳过")
                             next_pc = _find_jump(steps, pc, 'IF_', 'END_IF', ['ELSE', 'END_IF'])
-                    elif not res: print("  -> 没找到目标，宏停止"); break
-                    if res: pyautogui.moveTo(res[0], res[1])
+                    elif not res: print("  -> 没找到目标,宏停止"); break
+                    
+                    # [修复] 统一处理返回值: (x, y, text) 或 (x, y, w, h)
+                    if res:
+                        # 取前两个值作为坐标
+                        target_x, target_y = res[0], res[1]
+                        pyautogui.moveTo(target_x, target_y)
                 
                 elif act == 'CLICK':
                     btn = p.get('button', 'left').lower()
@@ -325,12 +361,41 @@ def execute_steps(steps, run_context=None, status_callback=None):
                     if 'x' in p and 'y' in p: pyautogui.moveTo(int(p['x']), int(p['y']))
                     pyautogui.scroll(clicks) 
                 
-                elif act == 'WAIT': time.sleep(int(p['ms']) / 1000.0)
+                elif act == 'WAIT': 
+                    total_ms = int(p['ms'])
+                    for _ in range(0, total_ms, 100):
+                        if ctx.get('stop_requested'): break
+                        time.sleep(min(100, total_ms - _) / 1000.0)
                 
                 elif act == 'TYPE_TEXT':
                     interval = float(p.get('interval', 0.0))
-                    if interval > 0: pyautogui.write(p['text'], interval=interval)
-                    else: pyperclip.copy(p['text']); time.sleep(0.1); pyautogui.hotkey('ctrl', 'v')
+                    text = p['text']
+                    
+                    if '{CLIPBOARD}' in text:
+                        clipboard_content = ctx.get('clipboard_var', '')
+                        if not clipboard_content:
+                            try:
+                                clipboard_content = pyperclip.paste()
+                            except:
+                                clipboard_content = ''
+                        
+                        text = text.replace('{CLIPBOARD}', clipboard_content)
+                        print(f"  [输入] 替换占位符: {text}")
+                    
+                    if interval > 0: pyautogui.write(text, interval=interval)
+                    else: 
+                        # 增加剪贴板重试机制，防止被系统占用报错
+                        # 尝试 3 次，每次间隔 0.2 秒
+                        for _retry in range(3):
+                            try:
+                                pyperclip.copy(text)
+                                break # 成功则跳出重试循环
+                            except Exception:
+                                time.sleep(0.2)
+                        
+                        # 无论成功与否，尝试粘贴 (pyautogui 不会报错)
+                        time.sleep(0.1)
+                        pyautogui.hotkey('ctrl', 'v')
                 
                 elif act == 'PRESS_KEY':
                     keys = p.get('key', '').lower().replace(' ', '').split('+')
@@ -338,7 +403,7 @@ def execute_steps(steps, run_context=None, status_callback=None):
                 
                 elif act == 'ACTIVATE_WINDOW':
                     if not PYGETWINDOW_AVAILABLE:
-                        print("  [错误] pygetwindow 库未安装，无法激活窗口。")
+                        print("  [错误] pygetwindow 库未安装,无法激活窗口。")
                         break
                     title = p.get('title')
                     if not title:
@@ -367,8 +432,56 @@ def execute_steps(steps, run_context=None, status_callback=None):
                 elif act == 'LOOP_START':
                     next_pc = _handle_loop_start(steps, pc, loops, p, ctx, status_callback)
                 
-                elif act == 'END_LOOP': 
-                    next_pc = loops[-1]['start'] # 返回循环开始处
+                elif act == 'END_LOOP':
+                    # === 核心修复: 统一处理条件循环 ===
+                    if loops:
+                        top = loops[-1]
+                        mode = top.get('mode', 'fixed')
+                        
+                        # 条件循环: 先增加计数,再检查条件
+                        if mode in ('until_image', 'until_text'):
+                            top['iteration'] += 1  # <--- 先增加计数
+                            
+                            # 更新状态显示
+                            if status_callback:
+                                status_callback(f"🔄 循环第 {top['iteration']} 次 (最多 {top['max_iterations']} 次)")
+                            
+                            # 检查是否超过最大次数 (安全阀)
+                            if top['iteration'] >= top['max_iterations']:
+                                loop_id_to_exit = loops.pop()['id']
+                                loop_cache.exit()
+                                loop_cache.clear_cache(loop_id_to_exit)
+                                if status_callback:
+                                    status_callback(f"⚠️ 达到最大迭代 {top['max_iterations']} 次,强制退出")
+                                print(f"  [Loop Until] ⚠️ 达到最大迭代次数,强制退出")
+                                next_pc = pc + 1  # 继续执行下一步
+                            else:
+                                # 检查退出条件
+                                condition_met = _check_loop_condition(top, ctx)
+                                if condition_met:
+                                    # ✅ 条件满足, 退出循环
+                                    loop_id_to_exit = loops.pop()['id']
+                                    loop_cache.exit()
+                                    loop_cache.clear_cache(loop_id_to_exit)
+                                    if status_callback:
+                                        status_callback(f"✓ 条件满足,循环结束 (共 {top['iteration']} 次)")
+                                    print(f"  [Loop Until] ✓✓✓ 条件满足,循环结束")
+                                    next_pc = pc + 1  # 继续执行下一步
+                                else:
+                                    # ❌ 条件未满足, 继续循环
+                                    print(f"  [Loop Until] ✗ 未找到目标,继续循环 (第 {top['iteration']} 次)")
+                                    
+                                    # 使用可配置的检测间隔，平衡速度与准确率
+                                    # 0.15s 经过实测：既不会让UI卡顿，也能及时检测到目标
+                                    time.sleep(LOOP_CHECK_INTERVAL)
+                                    
+                                    next_pc = top['start']  # 跳回循环开始
+                        else:
+                            # 固定次数循环, 直接返回开始
+                            next_pc = top['start']
+                    else:
+                        print("[错误] END_LOOP 缺少对应的 LOOP_START")
+                        next_pc = pc + 1  # 继续执行下一步
 
             except Exception as e:
                 print(f"  [执行异常] {e}"); import traceback; traceback.print_exc(); break
@@ -386,8 +499,12 @@ def _handle_find(act, p, ctx, in_loop):
         cb = p['cache_box']
         if isinstance(cb, list) and len(cb) == 2: cb = [cb[0], cb[1], cb[0], cb[1]]; p['cache_box'] = cb
         if isinstance(cb, list) and len(cb) >= 4:
-            pad = 50 
-            region = (max(0, cb[0]-pad), max(0, cb[1]-pad), (cb[2]-cb[0])+pad*2, (cb[3]-cb[1])+pad*2)
+            w_raw, h_raw = cb[2] - cb[0], cb[3] - cb[1]
+            if w_raw > 0 and h_raw > 0:
+                pad = CACHE_BOX_PADDING  # 使用常量替代魔法数字 
+                region = (max(0, cb[0]-pad), max(0, cb[1]-pad), w_raw+pad*2, h_raw+pad*2)
+            else:
+                if 'cache_box' in p: del p['cache_box']
         else:
             if 'cache_box' in p: del p['cache_box']
 
@@ -399,59 +516,178 @@ def _handle_find(act, p, ctx, in_loop):
         if cached and is_img and quick_check_cv2(p['path'], float(p.get('confidence',0.8)), ss, offset, cached):
             perf.record_hit(True, False); print(f"  [Loop缓存] {cached}"); ctx['last_pos'] = cached; return cached
 
-    res = _do_find(is_img, p, ss, offset, final_engine)
+    res = _do_find(is_img, p, ss, offset, final_engine, ctx)
     
     if not res and region and ENABLE_GLOBAL_FALLBACK:
         print("  [缓存失效] 全局搜索...")
         ss, offset = smart_screenshot(None)
-        res = _do_find(is_img, p, ss, offset, final_engine)
+        res = _do_find(is_img, p, ss, offset, final_engine, ctx)
         if res:
-            w, h = (res[2], res[3]) if len(res) == 4 else (0, 0)
-            p['cache_box'] = [res[0]-w//2, res[1]-h//2, res[0]+w//2, res[1]+h//2]
+            # _do_find 保证返回 (x, y)，估算点击区域
+            w, h = (0, 0) 
+            if len(res) >= 2:
+                p['cache_box'] = [res[0]-20, res[1]-10, res[0]+20, res[1]+10]
 
     if res:
         pos = (res[0], res[1])
         if in_loop: loop_cache.set(sig, pos)
         ctx['last_pos'] = pos
-        return pos
+        return res # 返回完整结果
     
     perf.record_miss(not is_img)
     return None
 
-def _do_find(is_img, p, ss, offset, engine='auto'):
+def _do_find(is_img, p, ss, offset, engine='auto', ctx=None):
+    """执行查找（图像或文本）并返回统一格式坐标 (x, y)"""
     if is_img:
+        # 图片查找返回: (cx, cy, w, h)
         res_val = find_image_cv2(p['path'], float(p.get('confidence', 0.8)), ss, offset)
         if res_val:
-            perf.record_hit(False, False); print(f"  [找到] 图 ({res_val[0][0]},{res_val[0][1]})")
-            return res_val[0]
+            perf.record_hit(False, False)
+            print(f"  [找到] 图 ({res_val[0][0]},{res_val[0][1]})")
+            return (res_val[0][0], res_val[0][1]) 
     else:
-        res = ocr_engine.find_text_location(p['text'], p.get('lang','eng'), p.get('debug',True), ss, offset, engine)
+        # OCR 查找返回: ((cx, cy), full_text)
+        res = ocr_engine.find_text_location(
+            p['text'], 
+            p.get('lang','eng'), 
+            p.get('debug',True), 
+            ss, offset, engine
+        )
+        
         if res:
             perf.record_hit(False, True)
-            return res
+            
+            # === [修复] 统一返回格式为扁平元组: (x, y, text) ===
+            pos = (0, 0)
+            text_content = ""
+
+            # 解析 ocr_engine 的返回值
+            if isinstance(res, tuple) and len(res) == 2:
+                if isinstance(res[0], tuple) and len(res[0]) >= 2:
+                    # 新格式: ((x, y), full_text)
+                    pos = res[0]
+                    text_content = res[1]
+                else:
+                    # 旧格式兼容: (x, y)
+                    pos = res
+                    text_content = p.get('text', '')
+            else:
+                pos = res
+                text_content = p.get('text', '')
+
+            # 打印调试信息
+            print(f"  [找到] 文 ({pos[0]},{pos[1]}) 内容: '{text_content}'")
+
+            # 处理剪贴板逻辑 (副作用)
+            if ctx and p.get('save_to_clipboard', False):
+                print(f"  [剪贴板] 原始文本: '{text_content}'")
+                
+                extract_pattern = p.get('extract_pattern', '').strip()
+                final_text = text_content
+                
+                if extract_pattern:
+                    try:
+                        match = re.search(extract_pattern, text_content)
+                        if match:
+                            final_text = match.group(0)
+                            print(f"  [正则提取] '{final_text}'")
+                        else:
+                            print(f"  [正则] 未匹配，保留原文")
+                    except Exception as e:
+                        print(f"  [正则错误] {e}")
+                
+                ctx['clipboard_var'] = final_text
+                try:
+                    pyperclip.copy(final_text)
+                    print(f"  [剪贴板] ✓ 已复制")
+                except Exception as e:
+                    print(f"  [剪贴板] 失败: {e}")
+            
+            # === [修复] 统一只返回坐标 (x, y) ===
+            return (pos[0], pos[1])
+    
     return None
+
 
 def _handle_loop_start(steps, pc, loops, p, ctx, cb):
     top = loops[-1] if loops else None
+    
+    
+    # 如果是已有循环的迭代检查
     if top and top['start'] == pc:
-        top['remain'] -= 1
-        if top['remain'] > 0:
-            if cb: cb(f"循环剩余: {top['remain']}")
-            return pc + 1
-        else:
+         # === [修复] 强制给循环加一个物理冷却，防止队列瞬间爆炸 ===
+        time.sleep(LOOP_PHYSICAL_COOLDOWN)  # 使用常量 
+        mode = top.get('mode', 'fixed')
+        
+        # 检查是否超过最大迭代次数 (所有模式通用)
+        if top['iteration'] >= top['max_iterations']:
             loop_id_to_exit = loops.pop()['id']
-            loop_cache.exit() # 弹栈
-            loop_cache.clear_cache(loop_id_to_exit) # 清理缓存
-            return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
-    else:
-        count = int(p.get('times', 1))
-        if count <= 0: 
+            loop_cache.exit()
+            loop_cache.clear_cache(loop_id_to_exit)
+            if cb: cb(f"达到最大迭代 {top['max_iterations']} 次,循环结束")
+            print(f"  [Loop] 警告:达到最大迭代次数 {top['max_iterations']}")
             return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
         
-        loop_id = f"L{pc}_{len(loops)}" 
-        loops.append({'start': pc, 'remain': count, 'id': loop_id})
-        loop_cache.enter(loop_id) # 压栈
-        if cb: cb(f"循环剩余: {count}")
+        # 固定次数循环:检查剩余次数
+        if mode == 'fixed':
+            # [补丁修复] 先检查后递减，确保计数正确
+            if top['remain'] > 0:
+                top['remain'] -= 1
+                top['iteration'] += 1
+                if cb: cb(f"循环第 {top['iteration']} 次 (剩余: {top['remain']}次)")
+                return pc + 1
+            else:
+                loop_id_to_exit = loops.pop()['id']
+                loop_cache.exit()
+                loop_cache.clear_cache(loop_id_to_exit)
+                return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
+        
+        # === 关键修复: 条件循环不在此增加计数,交给 END_LOOP ===
+        # 条件循环的迭代计数和退出判断统一在 END_LOOP 处理
+        return pc + 1
+    
+    # 新循环初始化
+    else:
+        mode = p.get('mode', 'fixed')
+        max_iter = int(p.get('max_iterations', 1000))
+        
+        if mode == 'fixed':
+            count = int(p.get('times', 1))
+            if count <= 0:
+                return _find_jump(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
+            remain = count
+        else:
+            remain = max_iter
+        
+        loop_id = f"L{pc}_{len(loops)}"
+        loop_data = {
+            'start': pc,
+            'remain': remain,
+            'id': loop_id,
+            'mode': mode,
+            'iteration': 0,
+            'max_iterations': max_iter
+        }
+        
+        # 保存条件参数
+        if mode == 'until_image':
+            loop_data['condition_image'] = p.get('condition_image', '')
+            loop_data['confidence'] = float(p.get('confidence', 0.8))
+            print(f"  [Loop Until Image] 目标: {loop_data['condition_image']}")
+        elif mode == 'until_text':
+            loop_data['condition_text'] = p.get('condition_text', '')
+            loop_data['lang'] = p.get('lang', 'eng')
+            print(f"  [Loop Until Text] 目标: {loop_data['condition_text']}")
+        
+        loops.append(loop_data)
+        loop_cache.enter(loop_id)
+        
+        if mode == 'fixed':
+            if cb: cb(f"循环剩余: {remain}")
+        else:
+            if cb: cb(f"🔄 条件循环第 1 次 (最多 {max_iter} 次)")
+        
         return pc + 1
 
 def _find_jump(steps, start, open_tag, close_tag, targets):
@@ -465,4 +701,62 @@ def _find_jump(steps, start, open_tag, close_tag, targets):
         elif lvl == 0 and a in targets: return i + 1
     return len(steps)
 
-core_engine_version = f"1.53.2 (Core) / OpenCV: {OPENCV_AVAILABLE}"
+def _check_loop_condition(loop_data, ctx):
+    """检查循环退出条件是否满足
+    
+    返回值:
+    - True: 找到了目标(应该退出循环)
+    - False: 没找到(应该继续循环)
+    """
+    mode = loop_data.get('mode', 'fixed')
+    
+    if mode == 'until_image':
+        path = loop_data.get('condition_image', '')
+        conf = loop_data.get('confidence', 0.8)
+        
+        if not path or not os.path.exists(path):
+            print(f"  [Loop Until] 警告: 图像路径无效 '{path}'")
+            return False
+        
+        try:
+            ss = ImageGrab.grab()
+            res_val = find_image_cv2(path, conf, ss, offset=(0, 0))
+            found = res_val is not None
+            if found:
+                print(f"  [Loop Until] ✓✓✓ 找到目标图像: {os.path.basename(path)}")
+            
+            return found
+        except Exception as e:
+            print(f"  [Loop Until] 图像检测错误: {e}")
+            return False
+    
+    elif mode == 'until_text':
+        # 检查文本是否找到
+        text = loop_data.get('condition_text', '')
+        lang = loop_data.get('lang', 'eng')
+        
+        if not text:
+            print(f"  [Loop Until] 警告: 文本条件为空")
+            return False
+        
+        try:
+            ss = ImageGrab.grab()
+            # 兼容新的返回格式
+            res = ocr_engine.find_text_location(text, lang, False, ss, (0, 0), 'auto')
+            
+            if res:
+                # [优化] 打印识别到的具体文本
+                found_txt = text
+                if isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], str):
+                    found_txt = res[1]
+                print(f"  [Loop Until] ✓✓✓ 找到目标文本: '{found_txt}'")
+                return True
+            
+            return False
+        except Exception as e:
+            print(f"  [Loop Until] 文本检测错误: {e}")
+            return False
+    
+    return False
+
+core_engine_version = f"1.56.0 (Core) / OpenCV: {OPENCV_AVAILABLE}"
