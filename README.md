@@ -65,7 +65,6 @@
 
 ### 1. 库依赖
     ** `requirements.txt` 内容:**
-    ```
     ttkbootstrap
     pyautogui
     pynput
@@ -75,7 +74,7 @@
     pytesseract
     rapidocr-onnxruntime
     windows-ocr
-    ```
+    
 
 请确保已使用 pip 安装所有这些库。
 
