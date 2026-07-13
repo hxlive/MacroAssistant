@@ -1,8 +1,8 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # core_engine.py
 # 描述:自动化宏的核心功能引擎
-# Version: 1.8.1
-CORE_VERSION = "1.8.1"
+# Version: 1.8.2
+CORE_VERSION = "1.8.2"
 
 # ======================================================================
 # 即时中断异常
@@ -324,6 +324,87 @@ class LoopCacheManager:
 
 loop_cache = LoopCacheManager()
 
+class RunContext:
+    """
+    宏执行上下文，封装单次宏运行的所有状态。
+    通过魔术方法实现对旧代码字典式访问的 100% 兼容。
+    不定义 __bool__，依赖 Python 默认对象真值（永远为 True），
+    以正确兼容代码中 `if ctx:` / `if not ctx:` 的 None 判断语义。
+    """
+    def __init__(self, raw_dict=None):
+        if isinstance(raw_dict, RunContext):
+            self._data = raw_dict._data
+            self.perf = raw_dict.perf
+            self.loop_cache = raw_dict.loop_cache
+            self._data['_goto_counts'] = {}
+            return
+
+        self._data = raw_dict if isinstance(raw_dict, dict) else {}
+        self._data.setdefault('vars', {})
+        self._data.setdefault('stop_requested', False)
+        self._data.setdefault('last_pos', (None, None))
+        self._data.setdefault('clipboard_var', '')
+        self._data.setdefault('_active_processes', set())
+        self._data.setdefault('_active_process_lock', __import__('threading').RLock())
+        self._data['_goto_counts'] = {}
+
+        self.perf = PerformanceMonitor()
+        self.loop_cache = LoopCacheManager()
+
+    def check_stop(self):
+        return self._data.get('stop_requested', False)
+
+    @property
+    def vars(self):
+        return self._data.setdefault('vars', {})
+
+    def get_var(self, name, default=None):
+        return self.vars.get(name, default)
+
+    def set_var(self, name, value):
+        self.vars[name] = value
+
+    def __getitem__(self, key): return self._data[key]
+    def __setitem__(self, key, val): self._data[key] = val
+    def get(self, key, default=None): return self._data.get(key, default)
+    def setdefault(self, key, default=None): return self._data.setdefault(key, default)
+    def __contains__(self, key): return key in self._data
+
+def _get_perf(ctx): return getattr(ctx, 'perf', perf)
+def _get_loop_cache(ctx): return getattr(ctx, 'loop_cache', loop_cache)
+
+
+def _ctx_check_stop(ctx):
+    if ctx is None:
+        return False
+    if hasattr(ctx, 'check_stop'):
+        return ctx.check_stop()
+    return bool(ctx.get('stop_requested', False))
+
+
+def _ctx_vars(ctx):
+    if ctx is None:
+        return {}
+    if hasattr(ctx, 'vars'):
+        return ctx.vars
+    return ctx.setdefault('vars', {})
+
+
+def _ctx_get_var(ctx, name, default=None):
+    if hasattr(ctx, 'get_var'):
+        return ctx.get_var(name, default)
+    return _ctx_vars(ctx).get(name, default)
+
+
+def _ctx_set_var(ctx, name, value):
+    if ctx is None:
+        return
+    if hasattr(ctx, 'set_var'):
+        ctx.set_var(name, value)
+    else:
+        _ctx_vars(ctx)[name] = value
+
+
 # ======================================================================
 # 核心工具函数
 # ======================================================================
@@ -350,11 +431,17 @@ def _safe_float(value, default=None, min_value=None, max_value=None):
     return result, True
 
 def _safe_param_int(p, name, default=None, min_value=None, max_value=None):
-    return _safe_int(p.get(name, default), default, min_value=min_value, max_value=max_value)
+    value = p.get(name, default)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        value = default
+    return _safe_int(value, default, min_value=min_value, max_value=max_value)
 
 
 def _safe_param_float(p, name, default=None, min_value=None, max_value=None):
-    return _safe_float(p.get(name, default), default, min_value=min_value, max_value=max_value)
+    value = p.get(name, default)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        value = default
+    return _safe_float(value, default, min_value=min_value, max_value=max_value)
 
 
 def _parse_optional_coords_or_break(p, action, x_key='x', y_key='y'):
@@ -419,7 +506,7 @@ def _run_with_fail_stop(action, p, fn, ctx=None, var_name=None, default_value=''
         return fn()
     except Exception as e:
         if ctx is not None and var_name is not None:
-            ctx.setdefault('vars', {})[var_name] = default_value
+            _ctx_set_var(ctx, var_name, default_value)
         print(f"  [错误] {action} 失败: {e}")
         if p.get('fail_stop', False):
             return _ACTION_BREAK
@@ -475,7 +562,7 @@ def _padded_bbox_to_region(raw_bbox, pad):
 
 def _copy_to_clipboard_with_retry(text, ctx=None, retries=3, delay=0.2):
     for _ in range(retries):
-        if ctx and ctx.get('stop_requested'):
+        if _ctx_check_stop(ctx):
             raise MacroStopException("Stop requested while writing to clipboard")
         try:
             pyperclip.copy(text)
@@ -573,7 +660,7 @@ def find_image_cv2(path, conf, screenshot_pil, offset=(0,0), enhanced_mode=False
         val, loc, w, h = best
         if val >= conf and loc:
             cx, cy = offset[0] + loc[0] + w//2, offset[1] + loc[1] + h//2
-            perf.record_time(time.time()-t0, False)
+            _get_perf(ctx).record_time(time.time()-t0, False)
             return (cx, cy, w, h), val
     except (cv2.error, ValueError, TypeError, AttributeError) as e:
         print(f"CV2找图错误: {e}")
@@ -722,7 +809,7 @@ def _ensure_text_output_path(safe_path, purpose='WRITE_FILE'):
 def _render_vars(param_str, ctx):
     if not isinstance(param_str, str) or not param_str: return param_str
     if '{' not in param_str: return param_str
-    vars_dict = ctx.get('vars', {})
+    vars_dict = _ctx_vars(ctx)
     def repl(match):
         var_name = match.group(1)
         return str(vars_dict.get(var_name, match.group(0)))
@@ -756,7 +843,7 @@ def _call_vlm_with_stop(instruction, region, ctx):
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
     while not done.wait(0.1):
-        if ctx.get('stop_requested'):
+        if _ctx_check_stop(ctx):
             raise MacroStopException("Stop requested while VLM request is active")
     if result['error'] is not None:
         raise result['error']
@@ -850,7 +937,7 @@ def _normalize_split_delimiter(value):
     return text
 
 def _set_foreach_line_vars(loop_data, ctx):
-    vars_dict = ctx.setdefault('vars', {})
+    vars_dict = _ctx_vars(ctx)
     items = loop_data.get('items', [])
     index = loop_data.get('index', 0)
     total = len(items)
@@ -944,7 +1031,7 @@ def _validate_calc_number(value):
     return value
 
 def _raise_if_stop_requested(ctx, message="Stop requested"):
-    if ctx and ctx.get('stop_requested'):
+    if _ctx_check_stop(ctx):
         raise MacroStopException(message)
 
 def _sleep_with_stop_check(seconds, ctx=None, interval=0.1):
@@ -1053,7 +1140,7 @@ def _handle_wait_action(p, ctx):
         return _ACTION_SKIP
     interrupted = False
     for elapsed_ms in range(0, total_ms, 100):
-        if ctx.get('stop_requested'):
+        if _ctx_check_stop(ctx):
             interrupted = True
             break
         time.sleep(min(100, total_ms - elapsed_ms) / 1000.0)
@@ -1127,7 +1214,7 @@ def _handle_activate_window_action(p, ctx):
         target_win.activate()
         print(f"  [成功] 已激活窗口: {target_win.title}")
         for _ in range(5):
-            if ctx.get('stop_requested'):
+            if _ctx_check_stop(ctx):
                 raise MacroStopException("用户在窗口激活期间请求停止")
             time.sleep(0.1) 
     except Exception as e:
@@ -1150,7 +1237,7 @@ def _handle_set_var_action(p, ctx):
     var_name = p.get('var_name', '').strip()
     var_value = _render_param(p, 'var_value', ctx)
     if var_name:
-        ctx['vars'][var_name] = var_value
+        _ctx_set_var(ctx, var_name, var_value)
         print(f"  [VAR] {var_name} = '{var_value}'")
     return _ACTION_DONE
 
@@ -1164,7 +1251,7 @@ def _handle_prompt_input_action(p, ctx):
     if not var_name:
         print("  [错误] PROMPT_INPUT 缺少变量名")
         return _ACTION_BREAK
-    if ctx.get('stop_requested'):
+    if _ctx_check_stop(ctx):
         raise MacroStopException("用户在输入前请求停止")
     callback = ctx.get('prompt_input_callback')
     try:
@@ -1178,8 +1265,8 @@ def _handle_prompt_input_action(p, ctx):
         raise MacroStopException("用户取消输入") from e
     if value is None:
         raise MacroStopException("用户取消输入")
-    ctx['vars'][var_name] = str(value)
-    print(f"  [变量] {var_name} = '{ctx['vars'][var_name]}' (用户输入)")
+    _ctx_set_var(ctx, var_name, str(value))
+    print(f"  [变量] {var_name} = '{_ctx_get_var(ctx, var_name)}' (用户输入)")
          
     return _ACTION_DONE
 
@@ -1194,8 +1281,8 @@ def _handle_read_file_action(p, ctx):
     def _do_read():
         safe_path = _resolve_safe_file_path(file_path, ctx, 'READ_FILE')
         with open(safe_path, 'r', encoding=encoding) as f:
-            ctx['vars'][var_name] = f.read()
-        print(f"  [变量] {var_name} 已读取文本文件 ({len(ctx['vars'][var_name])} 字符)")
+            _ctx_set_var(ctx, var_name, f.read())
+        print(f"  [变量] {var_name} 已读取文本文件 ({len(_ctx_get_var(ctx, var_name))} 字符)")
         return _ACTION_DONE
 
     return _run_with_fail_stop('READ_FILE', p, _do_read, ctx, var_name)
@@ -1211,7 +1298,7 @@ def _handle_extract_var_action(p, ctx):
     def _do_extract():
         match = re.search(pattern, source)
         val = match.group(1) if match and match.lastindex else (match.group(0) if match else '')
-        ctx['vars'][var_name] = val
+        _ctx_set_var(ctx, var_name, val)
         print(f"  [变量] {var_name} 提取为 '{val}'")
         return _ACTION_DONE
 
@@ -1231,11 +1318,11 @@ def _handle_json_extract_action(p, ctx):
         return _ACTION_BREAK
     try:
         val = _json_extract_value(source, json_path)
-        ctx['vars'][var_name] = val
+        _ctx_set_var(ctx, var_name, val)
         print(f"  [变量] {var_name} = '{val}' (JSON)")
     except _JSON_EXTRACT_ERRORS as e:
         if has_default:
-            ctx['vars'][var_name] = default_value
+            _ctx_set_var(ctx, var_name, default_value)
             print(f"  [JSON] 提取失败，使用默认值 '{default_value}': {e}")
         else:
             print(f"  [错误] JSON_EXTRACT 提取失败: {e}")
@@ -1315,7 +1402,7 @@ def _handle_calculate_action(p, ctx):
         return _ACTION_BREAK
     try:
         val = _safe_calculate_expression(expr)
-        ctx['vars'][var_name] = str(val)
+        _ctx_set_var(ctx, var_name, str(val))
         print(f"  [VAR] {var_name} = {val} (calculated)")
     except (ValueError, TypeError, OverflowError, SyntaxError, ZeroDivisionError) as e:
         print(f"  [ERROR] CALCULATE failed '{expr}': {e}")
@@ -1433,8 +1520,8 @@ def _handle_end_loop_control(steps, pc, loops, p, ctx, status_callback, goto_lab
 
     if top['iteration'] >= top['max_iterations']:
         loop_id_to_exit = loops.pop()['id']
-        loop_cache.exit()
-        loop_cache.clear_cache(loop_id_to_exit)
+        _get_loop_cache(ctx).exit()
+        _get_loop_cache(ctx).clear_cache(loop_id_to_exit)
         if status_callback:
             status_callback(f"WARN 达到最大迭代 {top['max_iterations']} 次,强制退出")
         print("  [Loop Until] WARN 达到最大迭代次数,强制退出")
@@ -1443,8 +1530,8 @@ def _handle_end_loop_control(steps, pc, loops, p, ctx, status_callback, goto_lab
     condition_met = _check_loop_condition(top, ctx)
     if condition_met:
         loop_id_to_exit = loops.pop()['id']
-        loop_cache.exit()
-        loop_cache.clear_cache(loop_id_to_exit)
+        _get_loop_cache(ctx).exit()
+        _get_loop_cache(ctx).clear_cache(loop_id_to_exit)
         if status_callback:
             status_callback(f"OK 条件满足,循环结束 (共 {top['iteration']} 次)")
         print("  [Loop Until] OK 条件满足,循环结束")
@@ -1541,7 +1628,7 @@ def _handle_ai_command_step(p, ctx):
 
 def _handle_find_or_condition_step(steps, pc, act, p, ctx):
     next_pc = pc + 1
-    res = _handle_find_with_retries(act, p, ctx, loop_cache.get_current_loop_id() is not None)
+    res = _handle_find_with_retries(act, p, ctx, _get_loop_cache(ctx).get_current_loop_id() is not None)
 
     if act.startswith('IF_'):
         if not res:
@@ -1566,16 +1653,10 @@ def _handle_find_or_condition_step(steps, pc, act, p, ctx):
 
 def execute_steps(steps, run_context=None, status_callback=None):
     print(f"\n--- 执行开始 (Core V{CORE_VERSION}) ---")
-    perf.reset(); loop_cache.reset()
+    perf.reset()
+    loop_cache.reset()
     _get_template.cache_clear()
-    ctx = run_context if run_context else {}
-    ctx.setdefault('last_pos', (None, None))
-    ctx.setdefault('stop_requested', False)
-    ctx.setdefault('clipboard_var', '')
-    ctx.setdefault('_active_processes', set())
-    ctx.setdefault('_active_process_lock', threading.RLock())
-    ctx.setdefault('vars', {})
-    ctx['_goto_counts'] = {}
+    ctx = RunContext(run_context)
     try:
         goto_labels = _build_goto_label_table(steps)
     except ValueError as e:
@@ -1593,11 +1674,12 @@ def execute_steps(steps, run_context=None, status_callback=None):
     try:
         while pc < len(steps):
 
-            if ctx.get('stop_requested', False): 
+            if _ctx_check_stop(ctx): 
                 print(f"  [停止] 用户请求停止 ({stop_key_display})")
                 break
                 
             step = steps[pc]
+            ctx['_current_step_index'] = pc
             act, p = _get_step_action_and_params(step)
             if _should_log_step(act, loops, ctx):
                 print(f"[{pc+1}] {act}")
@@ -1656,8 +1738,8 @@ def execute_steps(steps, run_context=None, status_callback=None):
         return pc >= len(steps)
     finally:
         cleanup_active_processes(ctx)
-        loop_cache.reset()
-        print(f"--- 执行结束 ---\n[统计] {perf.get_stats()}\n")
+        ctx.loop_cache.reset()
+        print(f"--- 执行结束 ---\n[统计] {ctx.perf.get_stats()}\n")
 
 def _handle_find_with_retries(act, p, ctx, in_loop):
     retry_count, ok = _safe_param_int(p, 'retry_count', 0, min_value=0)
@@ -1708,15 +1790,16 @@ def _handle_find(act, p, ctx, in_loop):
         enhanced_mode = ctx.get('enhanced_mode', False)
 
         if in_loop:
-            cached = loop_cache.get(sig)
+            cached = _get_loop_cache(ctx).get(sig)
             if cached and is_img:
                 confidence, ok = _safe_param_float(p, 'confidence', 0.8, min_value=0, max_value=1)
                 if not ok:
                     _warn_param_default(act, 'confidence', confidence)
                 if quick_check_cv2(p.get('path',''), confidence, ss, offset, cached, enhanced_mode):
-                    perf.record_hit(True, False); print(f"  [Loop缓存] {cached}"); ctx['last_pos'] = cached; return cached
+                    _get_perf(ctx).record_hit(True, False); print(f"  [Loop缓存] {cached}"); ctx['last_pos'] = cached; return cached
 
-        res = _do_find(is_img, p, ss, offset, final_engine, ctx)
+        ocr_cache_key = f"step:{ctx.get('_current_step_index', '?')}:{act}:{p.get('text', '')}:{p.get('region', p.get('cache_box', ''))}" if not is_img else None
+        res = _do_find(is_img, p, ss, offset, final_engine, ctx, ocr_cache_key)
         _raise_if_stop_requested(ctx, "Stop requested after find")
 
         # IF 动作不使用全局 fallback（会大幅降低性能，因为它已经重复搜索了）
@@ -1728,7 +1811,7 @@ def _handle_find(act, p, ctx, in_loop):
             ss = None
             ss, offset = smart_screenshot(None)
             _raise_if_stop_requested(ctx, "Stop requested after fallback screenshot")
-            res = _do_find(is_img, p, ss, offset, final_engine, ctx)
+            res = _do_find(is_img, p, ss, offset, final_engine, ctx, ocr_cache_key)
             _raise_if_stop_requested(ctx, "Stop requested after fallback find")
             if res:
                 if len(res) >= 2:
@@ -1736,21 +1819,21 @@ def _handle_find(act, p, ctx, in_loop):
 
         if res:
             pos = (res[0], res[1])
-            if in_loop: loop_cache.set(sig, pos)
+            if in_loop: _get_loop_cache(ctx).set(sig, pos)
             ctx['last_pos'] = pos
             if act in ('FIND_TEXT', 'IF_TEXT_FOUND') and len(res) >= 3:
                 save_var = p.get('save_to_var', '').strip()
                 if save_var:
-                    ctx.setdefault('vars', {})[save_var] = res[2]
+                    _ctx_set_var(ctx, save_var, res[2])
                     print(f"  [变量] {save_var} = '{res[2]}'")
             return res
 
-        perf.record_miss(not is_img)
+        _get_perf(ctx).record_miss(not is_img)
         return None
     finally:
         _close_image_quietly(ss)
 
-def _do_find(is_img, p, ss, offset, engine='auto', ctx=None):
+def _do_find(is_img, p, ss, offset, engine='auto', ctx=None, ocr_cache_key=None):
     """执行查找（图像或文本）并返回统一格式坐标 (x, y)"""
     enhanced_mode = ctx.get('enhanced_mode', False) if ctx else False
     if is_img:
@@ -1760,7 +1843,7 @@ def _do_find(is_img, p, ss, offset, engine='auto', ctx=None):
             _warn_param_default('FIND_IMAGE', 'confidence', confidence)
         res_val = find_image_cv2(p.get('path',''), confidence, ss, offset, enhanced_mode, ctx)
         if res_val:
-            perf.record_hit(False, False)
+            _get_perf(ctx).record_hit(False, False)
             print(f"  [找到] 图 ({res_val[0][0]},{res_val[0][1]})")
             return (res_val[0][0], res_val[0][1]) 
     else:
@@ -1768,12 +1851,12 @@ def _do_find(is_img, p, ss, offset, engine='auto', ctx=None):
         res = ocr_engine.find_text_location(
             p.get('text',''), 
             p.get('lang','eng'), 
-            p.get('debug',True), 
-            ss, offset, engine, enhanced_mode
+            p.get('debug', False), 
+            ss, offset, engine, enhanced_mode, cache_key=ocr_cache_key
         )
         
         if res:
-            perf.record_hit(False, True)
+            _get_perf(ctx).record_hit(False, True)
             
             # === [修复] 统一返回格式为扁平元组: (x, y, text) ===
             pos = (0, 0)
@@ -1919,8 +2002,8 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
         # 检查是否超过最大迭代次数 (所有模式通用)
         if top['iteration'] >= top['max_iterations']:
             loop_id_to_exit = loops.pop()['id']
-            loop_cache.exit()
-            loop_cache.clear_cache(loop_id_to_exit)
+            _get_loop_cache(ctx).exit()
+            _get_loop_cache(ctx).clear_cache(loop_id_to_exit)
             if cb: cb(f"达到最大迭代 {top['max_iterations']} 次,循环结束")
             print(f"  [Loop] 警告:达到最大迭代次数 {top['max_iterations']}")
             return _find_jump_or_raise(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
@@ -1936,8 +2019,8 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
                 return pc + 1
             else:
                 loop_id_to_exit = loops.pop()['id']
-                loop_cache.exit()
-                loop_cache.clear_cache(loop_id_to_exit)
+                _get_loop_cache(ctx).exit()
+                _get_loop_cache(ctx).clear_cache(loop_id_to_exit)
                 return _find_jump_or_raise(steps, pc, 'LOOP_START', 'END_LOOP', ['END_LOOP'])
         
         # === 关键修复: 条件循环不在此增加计数,交给 END_LOOP ===
@@ -2005,7 +2088,7 @@ def _handle_loop_start(steps, pc, loops, p, ctx, cb):
                 print(f"  [Loop Until Text] 目标: {loop_data['condition_text']} (全屏)")
         
         loops.append(loop_data)
-        loop_cache.enter(loop_id)
+        _get_loop_cache(ctx).enter(loop_id)
         
         if mode == 'fixed':
             if cb: cb(f"循环第 1 次 (共 {count} 次)")
@@ -2092,7 +2175,8 @@ def _check_loop_condition(loop_data, ctx):
             ss, offset = smart_screenshot(region)
             _raise_if_stop_requested(ctx, "Stop requested after loop screenshot")
             enhanced_mode = ctx.get('enhanced_mode', False) if ctx else False
-            res = ocr_engine.find_text_location(text, lang, False, ss, offset, 'auto', enhanced_mode)
+            cache_key = f"loop_until_text:{loop_data.get('start', '?')}:{text}:{loop_data.get('region', loop_data.get('cache_box', ''))}"
+            res = ocr_engine.find_text_location(text, lang, False, ss, offset, 'auto', enhanced_mode, cache_key=cache_key)
             
             if res:
                 found_txt = text
@@ -2210,7 +2294,7 @@ def _execute_subprocess(cmd_list, shell_mode, cwd, timeout, save_output, ctx, ru
 
         deadline = time.monotonic() + timeout
         while True:
-            if ctx.get('stop_requested'):
+            if _ctx_check_stop(ctx):
                 raise MacroStopException("Stop requested while RUN process is active")
             remaining = deadline - time.monotonic()
             if remaining <= 0:

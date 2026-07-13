@@ -1093,3 +1093,6 @@ class AboutDialog:
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Button(button_frame, text="确  定", command=self.dialog.destroy, bootstyle="primary", width=18, padding=(15, 8)).pack(anchor="center")
+
+
+

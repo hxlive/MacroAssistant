@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # MacroMate.py
 # 描述: 自动化宏的 GUI 界面
-# Version: 1.8.1
+# Version: 1.8.2
 
 
 # 使用: 
@@ -43,7 +43,7 @@ ctypes.pythonapi.PyThreadState_SetAsyncExc.restype = ctypes.c_int
 # =================================================================
 # 全局配置
 # =================================================================
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.8.2"
 APP_TITLE = f"智点助手 (MacroMate) v{APP_VERSION}"
 APP_ICON = "app_icon.ico" 
 def _get_program_dir():
@@ -496,13 +496,36 @@ class MacroApp:
         self.action_type.current(0)
 
         self.action_type.pack(anchor="w", fill=tk.X, pady=5)
-        self.action_type.bind("<<ComboboxSelected>>", self.update_param_fields)
+        self.action_type.bind("<<ComboboxSelected>>", self._on_action_type_selected)
+        self.action_type.bind("<FocusIn>", self._clear_combobox_text_selection, add="+")
+        self.action_type.bind("<ButtonRelease-1>", self._clear_combobox_text_selection, add="+")
 
         param_area = ttk.Frame(add_frame)
         param_area.pack(fill=tk.BOTH, expand=True, pady=5)
         self._build_scrollable_param_area(param_area)
 
         self.param_widgets = {}
+
+    def _clear_combobox_text_selection(self, event=None):
+        widget = getattr(event, 'widget', None) if event is not None else getattr(self, 'action_type', None)
+        if widget is None:
+            return
+
+        def clear_selection():
+            try:
+                widget.selection_clear()
+                widget.icursor(tk.END)
+            except tk.TclError:
+                pass
+
+        try:
+            widget.after_idle(clear_selection)
+        except tk.TclError:
+            pass
+
+    def _on_action_type_selected(self, event):
+        self.update_param_fields(event)
+        self._clear_combobox_text_selection(event)
 
     def _build_scrollable_param_area(self, parent):
         parent.columnconfigure(0, weight=1)
@@ -1085,6 +1108,7 @@ class MacroApp:
         # 1. 设置动作类型 (这将重置右侧面板为默认状态)
         self.action_type.set(MacroSchema.ACTION_TRANSLATIONS.get(step['action']))
         self.update_param_fields(None)
+        self._clear_combobox_text_selection()
         
         # ============================================================
         # [关键修复] 优先强制处理 LOOP_START 的模式
@@ -1786,3 +1810,8 @@ if __name__ == "__main__":
         main_window = tb.Window(themename=theme)
         app = MacroApp(main_window)
         main_window.mainloop()
+
+
+
+
+
