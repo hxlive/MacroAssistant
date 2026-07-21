@@ -1,34 +1,42 @@
 # -*- coding: utf-8 -*-
 # ocr_engine.py
 # 描述:自动化宏的 OCR 功能引擎
-# 版本:1.8.2
+# 版本:1.8.3
 
-from PIL import Image, ImageGrab
+from PIL import Image
 import re
 import os
 import subprocess
 import time
 import sys
 import threading
-import traceback
+import logging
 import unicodedata
+
+logger = logging.getLogger(__name__)
 
 RAPIDOCR_CLASS = None
 NUMPY_CV2_AVAILABLE = False
 
+# 重要：RapidOCR 类必须在模块加载阶段导入，不要改成首次 OCR 时再导入。
+# Windows 完整应用进程中，延迟导入曾触发 onnxruntime_pybind11_state 的
+# DLL 初始化失败；独立 Python 探针无法稳定复现。模型实例仍由
+# get_rapid_ocr_engine() 延迟创建，因此这里只保留类导入的稳定时序。
 try:
     import numpy as np
     import cv2
-    NUMPY_CV2_AVAILABLE = True
     from rapidocr import RapidOCR
-    RAPIDOCR_CLASS = RapidOCR 
+    RAPIDOCR_CLASS = RapidOCR
+    NUMPY_CV2_AVAILABLE = True
 except Exception as e:
-    print(f"[OCR] RapidOCR 依赖加载失败: {e}")
-    traceback.print_exc()
-    pass 
+    logger.exception("RapidOCR 依赖加载失败: %s", e)
 
 _RAPID_OCR_INSTANCE = None
 _RAPID_OCR_INIT_FAILED = False
+_RAPID_OCR_INIT_FAILURES = 0
+_RAPID_OCR_RETRY_AFTER = 0.0
+RAPIDOCR_INIT_MAX_FAILURES = 3
+RAPIDOCR_INIT_RETRY_DELAY = 2.0
 _RAPID_OCR_LOCK = threading.Lock() 
 _ENGINE_ERROR_LOGGED = {}
 _OCR_ERROR_LOG_LOCK = threading.Lock()
@@ -44,29 +52,58 @@ _OCR_POSITION_CACHE = {}
 _OCR_POSITION_CACHE_LOCK = threading.Lock()
 
 def preload_engines():
-    print("[OCR] 后台预热开始...")
+    logger.info("后台预热开始...")
     if NUMPY_CV2_AVAILABLE:
         get_rapid_ocr_engine()
     get_tesseract_cmd()
 
 def get_rapid_ocr_engine():
     global _RAPID_OCR_INSTANCE, _RAPID_OCR_INIT_FAILED
-    if _RAPID_OCR_INSTANCE: return _RAPID_OCR_INSTANCE
-    if not RAPIDOCR_CLASS: return None
-    
-    with _RAPID_OCR_LOCK: 
-        if _RAPID_OCR_INSTANCE: return _RAPID_OCR_INSTANCE
-        if _RAPID_OCR_INIT_FAILED: return None
+    global _RAPID_OCR_INIT_FAILURES, _RAPID_OCR_RETRY_AFTER
+
+    if _RAPID_OCR_INSTANCE:
+        return _RAPID_OCR_INSTANCE
+    if not NUMPY_CV2_AVAILABLE or RAPIDOCR_CLASS is None:
+        return None
+    if _RAPID_OCR_INIT_FAILED or time.monotonic() < _RAPID_OCR_RETRY_AFTER:
+        return None
+
+    with _RAPID_OCR_LOCK:
+        if _RAPID_OCR_INSTANCE:
+            return _RAPID_OCR_INSTANCE
+        if _RAPID_OCR_INIT_FAILED or time.monotonic() < _RAPID_OCR_RETRY_AFTER:
+            return None
         try:
-            print("[OCR] 正在加载 RapidOCR 模型...")
+            logger.info("正在加载 RapidOCR 模型...")
             t0 = time.time()
             _RAPID_OCR_INSTANCE = RAPIDOCR_CLASS()
-            print(f"[OCR] RapidOCR 就绪 ({time.time()-t0:.2f}s)")
+            _RAPID_OCR_INIT_FAILURES = 0
+            _RAPID_OCR_RETRY_AFTER = 0.0
+            logger.info("RapidOCR 就绪 (%.2fs)", time.time() - t0)
             return _RAPID_OCR_INSTANCE
         except Exception as e:
-            print(f"[严重错误] RapidOCR 初始化失败: {e}")
-            traceback.print_exc()
-            _RAPID_OCR_INIT_FAILED = True
+            _RAPID_OCR_INIT_FAILURES += 1
+            _RAPID_OCR_INIT_FAILED = (
+                _RAPID_OCR_INIT_FAILURES >= RAPIDOCR_INIT_MAX_FAILURES
+            )
+            if not _RAPID_OCR_INIT_FAILED:
+                _RAPID_OCR_RETRY_AFTER = (
+                    time.monotonic() + RAPIDOCR_INIT_RETRY_DELAY
+                )
+                retry_note = (
+                    f"，{RAPIDOCR_INIT_RETRY_DELAY:g} 秒后可重试"
+                )
+            else:
+                retry_note = "，本次运行已停用 RapidOCR"
+            message = (
+                "RapidOCR 初始化失败 "
+                f"({_RAPID_OCR_INIT_FAILURES}/{RAPIDOCR_INIT_MAX_FAILURES})"
+                f"{retry_note}: {e}"
+            )
+            if _RAPID_OCR_INIT_FAILED:
+                logger.exception(message)
+            else:
+                logger.warning(message)
             return None
 
 def get_tesseract_cmd():
@@ -106,7 +143,7 @@ def get_tesseract_cmd():
                 import pytesseract
                 pytesseract.pytesseract.tesseract_cmd = _TESSERACT_CMD
             except Exception as e:
-                print(f"[OCR] pytesseract 加载失败: {e}")
+                logger.warning("pytesseract 加载失败: %s", e)
                 _TESSERACT_CMD = None
         _TESSERACT_CHECKED = True
         return _TESSERACT_CMD
@@ -278,7 +315,7 @@ class _OcrContext:
         try:
             bgr = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
         except Exception as e:
-            print(f"  [OCR] 截图转换失败: {e}")
+            logger.warning("截图转换失败: %s", e)
             return None
         self._bgr_cache[cache_key] = (image_pil, bgr)
         return bgr
@@ -296,25 +333,15 @@ def _capture_ocr_context(screenshot_pil, offset):
         return _OcrContext(screenshot_pil, offset, False)
 
     try:
-        if sys.platform == 'win32':
-            import ctypes
-            SM_XVIRTUALSCREEN = 76
-            SM_YVIRTUALSCREEN = 77
-            SM_CXVIRTUALSCREEN = 78
-            SM_CYVIRTUALSCREEN = 79
-            user32 = ctypes.windll.user32
-            vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
-            vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
-            vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
-            vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
-            primary_w = user32.GetSystemMetrics(0)
-            primary_h = user32.GetSystemMetrics(1)
-            if vw > 0 and vh > 0 and (vx != 0 or vy != 0 or vw > primary_w or vh > primary_h):
-                return _OcrContext(ImageGrab.grab(all_screens=True), (vx, vy), True)
-            return _OcrContext(ImageGrab.grab(), (0, 0), True)
-        return _OcrContext(ImageGrab.grab(), (0, 0), True)
+        from sys_utils import capture_physical_bbox
+
+        screenshot, screen_offset = capture_physical_bbox()
+        return _OcrContext(screenshot, screen_offset, True)
     except OSError as e:
-        print(f"  [OCR] 截图失败 (锁屏或无显示器): {e}")
+        logger.warning("截图失败 (锁屏或无显示器): %s", e)
+        return None
+    except Exception as e:
+        logger.warning("截图失败 (锁屏或无显示器): %s", e)
         return None
 
 _ENGINE_SKIPPED = object()
@@ -331,9 +358,9 @@ def _print_match_debug(engine_name, ocr_pass, match):
     word = match.get('word') or {}
     score = word.get('score', 0.0)
     if match.get('kind') in ('single', 'single_exact', 'single_substring') and score > 0:
-        print(f"  [{display_name} OK]{label_part}{merge_part} ({cx}, {cy}) @ {score:.2f}")
+        logger.info("[%s OK]%s%s (%s, %s) @ %.2f", display_name, label_part, merge_part, cx, cy, score)
     else:
-        print(f"  [{display_name} OK]{label_part}{merge_part} ({cx}, {cy})")
+        logger.info("[%s OK]%s%s (%s, %s)", display_name, label_part, merge_part, cx, cy)
 
 
 def _result_from_match(match, full_text):
@@ -382,14 +409,14 @@ def _format_ocr_attempts(attempts):
 
 def _log_engine_error(engine_name, error, debug):
     if debug:
-        print(f"  [{engine_name}] 识别异常: {error}")
+        logger.warning("[%s] 识别异常: %s", engine_name, error)
         return
 
     with _OCR_ERROR_LOG_LOCK:
         if _ENGINE_ERROR_LOGGED.get(engine_name):
             return
         _ENGINE_ERROR_LOGGED[engine_name] = True
-    print(f"  [{engine_name}] 识别异常，已自动跳过该次结果: {error}")
+    logger.warning("[%s] 识别异常，已自动跳过该次结果: %s", engine_name, error)
 
 def _make_ocr_engine_runners(ctx, target_norm, lang, debug, enhanced_mode):
     def try_winocr(image_pil=ctx.screenshot, image_offset=ctx.offset):
@@ -421,16 +448,19 @@ def _make_ocr_engine_runners(ctx, target_norm, lang, debug, enhanced_mode):
         'tesseract': try_tesseract,
     }
 
-def _try_cached_position(ctx, target_norm, lang, debug, enhanced_mode, cache_key, engine_runners, attempts, tried_engines):
+def _try_cached_position(ctx, target_norm, lang, debug, enhanced_mode, cache_key, engine_runners, attempts, tried_engines, engine='auto'):
     cached = _get_ocr_position_cache(target_norm, lang, enhanced_mode, ctx.screenshot, ctx.offset, cache_key)
     if not cached:
         ocr_stats.record_cache('position_absent')
         return None
 
     cached_engine = cached.get('engine')
-    verification_order = ['winocr']
-    if cached_engine and cached_engine != 'winocr':
-        verification_order.append(cached_engine)
+    if engine == 'auto':
+        verification_order = ['winocr']
+        if cached_engine and cached_engine != 'winocr':
+            verification_order.append(cached_engine)
+    else:
+        verification_order = [engine]
 
     for pad_scale in OCR_POSITION_CACHE_PAD_SCALES:
         crop_img, crop_offset = _crop_around_cached_position(ctx.screenshot, ctx.offset, cached.get('pos', (0, 0)), target_norm, pad_scale)
@@ -441,7 +471,7 @@ def _try_cached_position(ctx, target_norm, lang, debug, enhanced_mode, cache_key
 
         try:
             if debug:
-                print(f"  [OCR cache] verify scale {pad_scale} {crop_img.width}x{crop_img.height} @ {crop_offset}")
+                logger.info("cache verify scale %s %sx%s @ %s", pad_scale, crop_img.width, crop_img.height, crop_offset)
             for engine_name in verification_order:
                 runner = engine_runners.get(engine_name)
                 if not runner:
@@ -452,10 +482,11 @@ def _try_cached_position(ctx, target_norm, lang, debug, enhanced_mode, cache_key
                     if pad_scale != OCR_POSITION_CACHE_PAD_SCALES[0]:
                         ocr_stats.record_cache('position_expand_hit')
                     ocr_stats.record_cache('position_winocr_hit' if engine_name == 'winocr' else 'position_cached_engine_hit')
-                    _remember_auto_engine(target_norm, lang, enhanced_mode, engine_name, cache_key)
+                    if engine == 'auto':
+                        _remember_auto_engine(target_norm, lang, enhanced_mode, engine_name, cache_key)
                     _remember_ocr_position(target_norm, lang, enhanced_mode, ctx.screenshot, ctx.offset, result[0], engine_name, cache_key)
                     if debug and attempts:
-                        print(f"  [OCR auto] cache {_format_ocr_attempts(attempts)}")
+                        logger.info("auto cache %s", _format_ocr_attempts(attempts))
                     return result
         finally:
             try:
@@ -548,11 +579,12 @@ def find_text_location(target_text, lang='eng', debug=False, screenshot_pil=None
         engine_runners = _make_ocr_engine_runners(ctx, target_norm, lang, debug, enhanced_mode)
         engine_order = _get_auto_engine_order(target_norm, lang, enhanced_mode, cache_key) if engine == 'auto' else (engine,)
 
-        if engine == 'auto':
-            cached_result = _try_cached_position(ctx, target_norm, lang, debug, enhanced_mode, cache_key, engine_runners, attempts, tried_engines)
+        if engine == 'auto' or engine in engine_runners:
+            cached_result = _try_cached_position(ctx, target_norm, lang, debug, enhanced_mode, cache_key, engine_runners, attempts, tried_engines, engine)
             if cached_result:
                 return cached_result
-            engine_order = _defer_tried_engines(engine_order, tried_engines)
+            if engine == 'auto':
+                engine_order = _defer_tried_engines(engine_order, tried_engines)
 
         if engine == 'auto' and engine_order:
             ocr_stats.record_cache('full_search')
@@ -563,18 +595,18 @@ def find_text_location(target_text, lang='eng', debug=False, screenshot_pil=None
                 continue
             result = _run_ocr_engine(engine_name, runner, target_norm, ctx.offset, debug, attempts)
             if result:
+                _remember_ocr_position(target_norm, lang, enhanced_mode, ctx.screenshot, ctx.offset, result[0], engine_name, cache_key)
                 if engine == 'auto':
                     _remember_auto_engine(target_norm, lang, enhanced_mode, engine_name, cache_key)
-                    _remember_ocr_position(target_norm, lang, enhanced_mode, ctx.screenshot, ctx.offset, result[0], engine_name, cache_key)
                     if debug and attempts:
-                        print(f"  [OCR auto] {_format_ocr_attempts(attempts)}")
+                        logger.info("auto %s", _format_ocr_attempts(attempts))
                 return result
 
         if debug:
-            print(f"  [失败] 未能找到 '{target_text}' (模式: {engine})")
+            logger.info("未能找到目标文本 (模式: %s, 长度: %s)", engine, len(target_text))
         if debug and engine == 'auto' and attempts:
-            print(f"  [OCR auto] {_format_ocr_attempts(attempts)}")
-        if debug: print(f"  [统计] {ocr_stats.get_stats()}")
+            logger.info("auto %s", _format_ocr_attempts(attempts))
+        if debug: logger.info("统计: %s", ocr_stats.get_stats())
         return None
     finally:
         ctx.close()
@@ -766,13 +798,13 @@ def _recognize_rapidocr_words(inst, debug, img_bgr, enhanced_mode=False):
             pixels = img_bgr.shape[0] * img_bgr.shape[1]
             scales = (1, 2) if enhanced_mode and pixels <= RAPIDOCR_ENHANCED_MAX_PIXELS else (1,)
             if debug and enhanced_mode and scales == (1,):
-                print(f"  [RapidOCR] 图像过大({pixels} px)，跳过 2x 放大")
+                logger.info("RapidOCR 图像过大(%s px)，跳过 2x 放大", pixels)
 
             for scale in scales:
                 ocr_pass = run_at_scale(scale)
                 if ocr_pass:
                     if debug and scale != 1:
-                        print(f"  [RapidOCR] 放大 {scale}x 后识别到文本")
+                        logger.info("RapidOCR 放大 %sx 后识别到文本", scale)
                     yield ocr_pass
         except Exception as e:
             _log_engine_error('RapidOCR', e, debug)
@@ -829,7 +861,7 @@ def _recognize_tesseract_words(lang, debug, screenshot_pil, enhanced_mode=False)
                         all_texts.append(data['text'][i])
 
                 full_text = ' '.join(all_texts)
-                if debug: print(f"  [Tesseract] PSM {psm} 识别 {len(words)} 词")
+                if debug: logger.info("Tesseract PSM %s 识别 %s 词", psm, len(words))
                 yield _recognition_pass(words, full_text, 'Tesseract', f'PSM {psm}')
         except Exception as e:
             _log_engine_error('Tesseract', e, debug)
@@ -851,7 +883,11 @@ def _is_winocr_available():
         return False
 
 def _is_rapidocr_available_lightweight():
-    return NUMPY_CV2_AVAILABLE and RAPIDOCR_CLASS is not None and not _RAPID_OCR_INIT_FAILED
+    return (
+        NUMPY_CV2_AVAILABLE
+        and RAPIDOCR_CLASS is not None
+        and not _RAPID_OCR_INIT_FAILED
+    )
 
 def get_available_engines():
     engines = []

@@ -1,23 +1,27 @@
 # gui_utils.py
 # 描述：GUI 组件工厂与界面逻辑处理 (重构版)
-# 版本：1.8.1
+# 版本：1.8.3
 
 import sys
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 import ttkbootstrap as ttk
 import os
 import re
+import math
+import logging
+import base64
+import queue
+
+logger = logging.getLogger(__name__)
+
+from sys_utils import capture_physical_bbox, center_child_window
 
 # 引入核心库中的工具用于处理快捷键显示
 try:
-    from core_engine import HotkeyUtils, MacroSchema
+    from core_engine import MacroSchema
 except ImportError:
     # Fallback
-    class HotkeyUtils:
-        @staticmethod
-        def format_hotkey_display(s): return s.upper()
-
     class MacroSchema:
         LANG_OPTIONS = {}
         CLICK_OPTIONS = {}
@@ -53,7 +57,6 @@ _OPTIONAL_PARAM_KEYS = {
     '*': {'region', 'extract_pattern', 'save_to_var'},
     'SET_VAR': {'var_value'},
     'WRITE_FILE': {'content', 'append'},
-    'JSON_EXTRACT': {'default_value', 'json_path'},
     'PROMPT_INPUT': {'default_value'},
     'FOREACH_LINE': {'file_path', 'source_text', 'split_delimiter', 'field_names'},
     'IF_VAR': {'var_value', 'expected_val'},
@@ -89,7 +92,7 @@ _SIMPLE_ACTION_FORM_FIELDS = {
         ('entry', 'x', 'X 坐标 (可选, 留空=当前位置):', '', None),
         ('entry', 'y', 'Y 坐标 (可选, 留空=当前位置):', '', None),
         ('entry', 'clicks', '点击次数 (可选, 默认1):', '', None),
-        ('entry', 'interval', '点击间隔秒 (可选, 默认0):', '', None),
+        ('entry', 'interval', '点击间隔毫秒 (可选, 默认0):', '', None),
         ('entry', 'duration', '按下持续秒 (可选, 默认0):', '', None),
     ),
     'SCROLL': (
@@ -128,7 +131,7 @@ _SIMPLE_ACTION_FORM_FIELDS = {
 }
 
 _SIMPLE_ACTION_HINTS = {
-    'CLICK': '* 提示: X/Y 留空则在当前鼠标位置点击；clicks/interval/duration 留空则使用默认值（1次/0秒/0秒）。',
+    'CLICK': '* 提示: X/Y 留空则在当前鼠标位置点击；clicks/interval/duration 留空则使用默认值（1次/0毫秒/0秒）。',
     'SCROLL': '* 提示: 如果 X, Y 为空，将在当前鼠标位置滚动。',
     'TYPE_TEXT': "* 此功能使用剪贴板 (Ctrl+V)，以支持中文及复杂文本输入。\n* 支持占位符: {CLIPBOARD} 将替换为剪贴板内容\n* 示例: '订单号: {CLIPBOARD}' → '订单号: 12345'",
     'ACTIVATE_WINDOW': '* 提示: 宏将查找标题中包含此文本的窗口，并将其激活到最前端。',
@@ -205,8 +208,8 @@ def _validate_numeric_param(key, value):
             parsed_float = float(text)
         except (ValueError, TypeError):
             return f"parameter '{key}' must be a non-negative number"
-        if parsed_float < 0:
-            return f"parameter '{key}' must be a non-negative number"
+        if not math.isfinite(parsed_float) or parsed_float < 0:
+            return f"parameter '{key}' must be a finite non-negative number"
         return None
 
     try:
@@ -223,7 +226,7 @@ def _validate_confidence(value):
         confidence = float(str(value).strip())
     except (ValueError, TypeError):
         return "参数 'confidence' 必须是数字（如 0.8）"
-    if not (0.0 < confidence <= 1.0):
+    if not math.isfinite(confidence) or not (0.0 < confidence <= 1.0):
         return "参数 'confidence' 必须在 0.0 ~ 1.0 之间"
     return None
 
@@ -232,8 +235,9 @@ def _validate_retry_interval(value):
     if not value:
         return None
     try:
-        if float(str(value).strip()) < 0:
-            return "参数 'retry_interval' 必须大于等于 0"
+        retry_interval = float(str(value).strip())
+        if not math.isfinite(retry_interval) or retry_interval < 0:
+            return "参数 'retry_interval' 必须是大于等于 0 的有限数字"
     except (ValueError, TypeError):
         return "参数 'retry_interval' 必须是数字（如 0.5）"
     return None
@@ -364,6 +368,8 @@ class AutoWrapLabel(ttk.Label):
 
 
 class MultiLineParamText(tk.Text):
+    """Text widget with the Entry-like get/delete/insert calls used by form binding."""
+
     def get(self, *args):
         if not args:
             return super().get("1.0", "end-1c")
@@ -556,7 +562,7 @@ class ParamWidgetFactory:
         return self.create_param_combobox(parent, "engine", "OCR 引擎:",
                                           combobox_values, default="自动选择 (Auto)")
 
-    def create_region_selector(self, parent, default_val="", on_select_callback=None):
+    def create_region_selector(self, parent, default_val="", on_select_callback=None, on_preview_callback=None):
         """创建区域选择器"""
         frame = ttk.Frame(parent)
         ttk.Label(frame, text="搜索范围 (x1,y1,x2,y2) [留空=全屏]:", font=self.font_ui).pack(anchor="w")
@@ -566,16 +572,29 @@ class ParamWidgetFactory:
 
         entry = ttk.Entry(input_frame, font=self.font_ui)
         entry.insert(0, str(default_val) if default_val else "")
-        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         def on_click():
             if on_select_callback:
                 on_select_callback(entry)
 
-        btn = ttk.Button(input_frame, text="🎯 框选", width=8,
+        btn = ttk.Button(input_frame, text="框选", width=5,
                          command=on_click,
                          bootstyle="info-outline")
-        btn.pack(side=tk.RIGHT, padx=(5, 0))
+        btn.pack(side=tk.RIGHT, padx=(4, 0))
+
+        def on_preview():
+            if on_preview_callback:
+                on_preview_callback(entry)
+
+        preview_btn = ttk.Button(
+            input_frame,
+            text="预览",
+            width=5,
+            command=on_preview,
+            bootstyle="danger-outline",
+        )
+        preview_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         frame.pack(fill=tk.X, pady=8)
         return entry  # 返回 Entry 控件
@@ -644,12 +663,6 @@ class ParamWidgetFactory:
 
         return panel
 
-    def browse_image(self, parent):
-        """浏览图片文件"""
-        f = filedialog.askopenfilename(filetypes=[("PNG", "*.png"), ("All", "*.*")])
-        if f:
-            return os.path.abspath(f)
-        return None
 
     def _add_find_retry_options(self, parent_frame, param_widgets, include_ignore_fail=False):
         param_widgets['retry_count'] = self.create_param_entry(parent_frame, "retry_count", "失败重试次数:", "0")
@@ -679,10 +692,10 @@ class ParamWidgetFactory:
 
 
     def _build_image_find_form(self, action_key, parent_frame, param_widgets, on_select_region,
-                               browse_image_cb, on_test_find_image):
+                               browse_image_cb, on_test_find_image, on_preview_region=None):
         is_if_action = action_key == 'IF_IMAGE_FOUND'
         param_widgets['path'] = self.create_param_entry(parent_frame, "path", "图像路径:", "button.png")
-        param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
+        param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region, on_preview_region)
         confidence_label = "置信度:" if is_if_action else "置信度(0.1-1.0):"
         param_widgets['confidence'] = self.create_param_entry(parent_frame, "confidence", confidence_label, "0.8")
         self._add_find_retry_options(parent_frame, param_widgets, include_ignore_fail=not is_if_action)
@@ -693,11 +706,11 @@ class ParamWidgetFactory:
         self.create_test_button(parent_frame, test_label, on_test_find_image)
 
     def _build_text_find_form(self, action_key, parent_frame, param_widgets, available_ocr_keys,
-                              on_select_region, on_test_find_text):
+                              on_select_region, on_test_find_text, on_preview_region=None):
         is_if_action = action_key == 'IF_TEXT_FOUND'
         label_text = "查找文本:" if is_if_action else "查找的文本:"
         param_widgets['text'] = self.create_param_entry(parent_frame, "text", label_text, "确定")
-        param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
+        param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region, on_preview_region)
         param_widgets['lang'] = self.create_param_combobox(parent_frame, "lang", "语言:", list(MacroSchema.LANG_OPTIONS.keys()))
         param_widgets['engine'] = self.create_ocr_engine_combobox(parent_frame, available_ocr_keys)
         self._add_find_retry_options(parent_frame, param_widgets, include_ignore_fail=not is_if_action)
@@ -735,6 +748,51 @@ class ParamWidgetFactory:
             self.create_instruction_panel(parent_frame, title, list(lines))
 
 
+    def _build_ai_command_form(self, parent_frame, param_widgets, on_select_region, on_test_ai_command, on_preview_region=None):
+        param_widgets['instruction'] = self.create_param_text(parent_frame, "instruction", "AI 指令:", "点击列表里价格最低的那个商品", height=3)
+        param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region, on_preview_region)
+        self.create_hint_label(parent_frame, "* 提示: 输入自然语言指令，如 '点击确定按钮'\n* AI 会分析屏幕截图，理解指令并返回坐标\n* 支持: OpenAI, Anthropic, DeepSeek, 智谱, 通义千问等")
+        self.create_test_button(parent_frame, "🧪 测试 AI 指令", on_test_ai_command)
+
+    def _build_run_form(self, parent_frame, param_widgets, update_run_params_cb):
+        run_type_options = MacroSchema.RUN_TYPE_OPTIONS
+        param_widgets['run_type'] = self.create_param_combobox(parent_frame, "run_type", "类型:", list(run_type_options.keys()), default=MacroSchema.RUN_TYPE_DISPLAY_BY_VALUE.get('command', 'command (命令)'))
+        param_widgets['command'] = self.create_param_entry(parent_frame, "command", "命令:", "curl")
+        param_widgets['args'] = self.create_param_text(parent_frame, "args", "参数:", "", height=3)
+        param_widgets['script_path'] = self.create_file_path_entry(parent_frame, "script_path", "脚本路径:", "process.py", filetypes=[("Scripts", "*.py *.js *.ps1"), ("All", "*.*")])
+        param_widgets['interpreter'] = self.create_param_combobox(parent_frame, "interpreter", "解释器:", ["python", "node", "powershell"], default="python")
+        param_widgets['timeout'] = self.create_param_entry(parent_frame, "timeout", "超时(秒):", "30")
+        param_widgets['cwd'] = self.create_param_entry(parent_frame, "cwd", "工作目录:", "")
+        param_widgets['save_output'] = self.create_param_checkbox(parent_frame, "save_output", "[OK] 保存输出到剪贴板", default=False)
+        param_widgets['shell_mode'] = self.create_param_checkbox(parent_frame, "shell_mode", "[警告] shell 模式 (仅可信宏)", default=False)
+        param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] RUN 失败时停止宏", default=False)
+        self.create_hint_label(parent_frame, "* {CLIPBOARD} = 剪贴板内容, {DATETIME} = 当前时间")
+        param_widgets['run_type'].bind("<<ComboboxSelected>>", update_run_params_cb)
+        update_run_params_cb(None)
+
+    def _build_move_to_form(self, parent_frame, param_widgets, mouse_tracker, mouse_pos_var):
+        param_widgets['x'] = self.create_param_entry(parent_frame, "x", "X 坐标:", "100")
+        param_widgets['y'] = self.create_param_entry(parent_frame, "y", "Y 坐标:", "100")
+        ttk.Separator(parent_frame, orient='horizontal').pack(fill='x', pady=(15, 5))
+        ttk.Label(parent_frame, text="当前鼠标位置 (参考):", font=self.font_ui, foreground='gray').pack(anchor="w", pady=(5, 0))
+        if mouse_pos_var is not None:
+            ttk.Label(parent_frame, textvariable=mouse_pos_var, font=self.font_code, bootstyle="info").pack(anchor="w")
+        if mouse_tracker is not None:
+            mouse_tracker.start()
+
+    def _build_loop_start_form(self, parent_frame, param_widgets, on_select_region, update_loop_params_cb, on_preview_region=None):
+        param_widgets['mode'] = self.create_param_combobox(parent_frame, "mode", '循环模式:', list(LOOP_MODE_OPTIONS.keys()), default=LOOP_MODE_DISPLAY_BY_VALUE.get('fixed', '固定次数'))
+        param_widgets['times'] = self.create_param_entry(parent_frame, "times", "循环次数:", "10")
+        param_widgets['max_iterations'] = self.create_param_entry(parent_frame, "max_iterations", "最大迭代次数 (安全阀):", "1000")
+        param_widgets['condition_image'] = self.create_param_entry(parent_frame, "condition_image", "目标图像路径:", "target.png")
+        param_widgets['confidence'] = self.create_param_entry(parent_frame, "confidence", "置信度:", "0.8")
+        param_widgets['condition_text'] = self.create_param_entry(parent_frame, "condition_text", "目标文本:", "加载完成")
+        param_widgets['lang'] = self.create_param_combobox(parent_frame, "lang", "语言:", list(MacroSchema.LANG_OPTIONS.keys()))
+        param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region, on_preview_region)
+        self.create_hint_label(parent_frame, "* 提示:\n- 固定次数: 传统循环\n- 直到找到图像: 找到即停\n- 直到找到文本: 找到即停\n- 最大迭代: 安全机制")
+        param_widgets['mode'].bind("<<ComboboxSelected>>", update_loop_params_cb)
+        update_loop_params_cb(None)
+
     def build_action_form(self, action_key, parent_frame, param_widgets, available_ocr_keys, callbacks):
         """
         构建指定动作类型的参数表单界面
@@ -748,6 +806,7 @@ class ParamWidgetFactory:
         """
         # 快捷访问回调
         on_select_region = callbacks.get('on_select_region')
+        on_preview_region = callbacks.get('on_preview_region')
         browse_image_cb = callbacks.get('browse_image')
         on_test_find_image = callbacks.get('on_test_find_image_click')
         on_test_find_text = callbacks.get('on_test_find_text_click')
@@ -769,66 +828,31 @@ class ParamWidgetFactory:
                 return "SWITCH_TO_FIND_IMAGE"
 
         if action_key == 'FIND_IMAGE':
-            self._build_image_find_form(action_key, parent_frame, param_widgets, on_select_region, browse_image_cb, on_test_find_image)
+            self._build_image_find_form(action_key, parent_frame, param_widgets, on_select_region, browse_image_cb, on_test_find_image, on_preview_region)
 
         elif action_key == 'FIND_TEXT':
-            self._build_text_find_form(action_key, parent_frame, param_widgets, available_ocr_keys, on_select_region, on_test_find_text)
+            self._build_text_find_form(action_key, parent_frame, param_widgets, available_ocr_keys, on_select_region, on_test_find_text, on_preview_region)
 
         elif action_key in _SIMPLE_ACTION_FORM_FIELDS:
             self._build_simple_action_form(action_key, parent_frame, param_widgets)
 
         elif action_key == 'AI_COMMAND':
-            param_widgets['instruction'] = self.create_param_text(parent_frame, "instruction", "AI 指令:", "点击列表里价格最低的那个商品", height=3)
-            param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
-            self.create_hint_label(parent_frame, "* 提示: 输入自然语言指令，如 '点击确定按钮'\n* AI 会分析屏幕截图，理解指令并返回坐标\n* 支持: OpenAI, Anthropic, DeepSeek, 智谱, 通义千问等")
-            self.create_test_button(parent_frame, "🧪 测试 AI 指令", on_test_ai_command)
-        
+            self._build_ai_command_form(parent_frame, param_widgets, on_select_region, on_test_ai_command, on_preview_region)
+
         elif action_key == 'RUN':
-            run_type_options = MacroSchema.RUN_TYPE_OPTIONS
-            param_widgets['run_type'] = self.create_param_combobox(parent_frame, "run_type", "类型:", list(run_type_options.keys()), default=MacroSchema.RUN_TYPE_DISPLAY_BY_VALUE.get('command', 'command (命令)'))
-            param_widgets['command'] = self.create_param_entry(parent_frame, "command", "命令:", "curl")
-            param_widgets['args'] = self.create_param_text(parent_frame, "args", "参数:", "", height=3)
-            param_widgets['script_path'] = self.create_file_path_entry(parent_frame, "script_path", "脚本路径:", "process.py", filetypes=[("Scripts", "*.py *.js *.ps1"), ("All", "*.*")])
-            param_widgets['interpreter'] = self.create_param_combobox(parent_frame, "interpreter", "解释器:", ["python", "node", "powershell"], default="python")
-            param_widgets['timeout'] = self.create_param_entry(parent_frame, "timeout", "超时(秒):", "30")
-            param_widgets['cwd'] = self.create_param_entry(parent_frame, "cwd", "工作目录:", "")
-            param_widgets['save_output'] = self.create_param_checkbox(parent_frame, "save_output", "[OK] 保存输出到剪贴板", default=False)
-            param_widgets['shell_mode'] = self.create_param_checkbox(parent_frame, "shell_mode", "[警告] shell 模式 (仅可信宏)", default=False)
-            param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] RUN 失败时停止宏", default=False)
-            self.create_hint_label(parent_frame, "* {CLIPBOARD} = 剪贴板内容, {DATETIME} = 当前时间")
-            if 'run_type' in param_widgets:
-                param_widgets['run_type'].bind("<<ComboboxSelected>>", update_run_params_cb)
-            update_run_params_cb(None)
+            self._build_run_form(parent_frame, param_widgets, update_run_params_cb)
 
         elif action_key == 'MOVE_TO':
-            param_widgets['x'] = self.create_param_entry(parent_frame, "x", "X 坐标:", "100")
-            param_widgets['y'] = self.create_param_entry(parent_frame, "y", "Y 坐标:", "100")
-            ttk.Separator(parent_frame, orient='horizontal').pack(fill='x', pady=(15, 5))
-            ttk.Label(parent_frame, text="当前鼠标位置 (参考):", font=self.font_ui, foreground='gray').pack(anchor="w", pady=(5,0))
-            if mouse_pos_var is not None:
-                ttk.Label(parent_frame, textvariable=mouse_pos_var, font=self.font_code, bootstyle="info").pack(anchor="w")
-            if mouse_tracker is not None:
-                mouse_tracker.start()
-            
+            self._build_move_to_form(parent_frame, param_widgets, mouse_tracker, mouse_pos_var)
+
         elif action_key == 'IF_IMAGE_FOUND':
-            self._build_image_find_form(action_key, parent_frame, param_widgets, on_select_region, browse_image_cb, on_test_find_image)
+            self._build_image_find_form(action_key, parent_frame, param_widgets, on_select_region, browse_image_cb, on_test_find_image, on_preview_region)
 
         elif action_key == 'IF_TEXT_FOUND':
-            self._build_text_find_form(action_key, parent_frame, param_widgets, available_ocr_keys, on_select_region, on_test_find_text)
+            self._build_text_find_form(action_key, parent_frame, param_widgets, available_ocr_keys, on_select_region, on_test_find_text, on_preview_region)
 
         elif action_key == 'LOOP_START':
-            param_widgets['mode'] = self.create_param_combobox(parent_frame, "mode", '循环模式:', list(LOOP_MODE_OPTIONS.keys()), default=LOOP_MODE_DISPLAY_BY_VALUE.get('fixed', '固定次数'))
-            param_widgets['times'] = self.create_param_entry(parent_frame, "times", "循环次数:", "10")
-            param_widgets['max_iterations'] = self.create_param_entry(parent_frame, "max_iterations", "最大迭代次数 (安全阀):", "1000")
-            param_widgets['condition_image'] = self.create_param_entry(parent_frame, "condition_image", "目标图像路径:", "target.png")
-            param_widgets['confidence'] = self.create_param_entry(parent_frame, "confidence", "置信度:", "0.8")
-            param_widgets['condition_text'] = self.create_param_entry(parent_frame, "condition_text", "目标文本:", "加载完成")
-            param_widgets['lang'] = self.create_param_combobox(parent_frame, "lang", "语言:", list(MacroSchema.LANG_OPTIONS.keys()))
-            param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region)
-            self.create_hint_label(parent_frame, "* 提示:\n- 固定次数: 传统循环\n- 直到找到图像: 找到即停\n- 直到找到文本: 找到即停\n- 最大迭代: 安全机制")
-            if 'mode' in param_widgets:
-                param_widgets['mode'].bind("<<ComboboxSelected>>", update_loop_params_cb)
-            update_loop_params_cb(None)
+            self._build_loop_start_form(parent_frame, param_widgets, on_select_region, update_loop_params_cb, on_preview_region)
 
         elif action_key == 'ELSE':
             self.create_hint_label(parent_frame, "* 提示: 'ELSE' 必须与 'IF' 配合使用。")
@@ -851,15 +875,6 @@ class ParamWidgetFactory:
             param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "保存至变量:", "price")
             param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] 提取失败时停止宏", default=False)
             self.create_hint_label(parent_frame, "* 提示: 使用正则表达式提取，例如 \\d+ 提取纯数字。")
-
-        elif action_key == 'JSON_EXTRACT':
-            param_widgets['source_json'] = self.create_param_text(parent_frame, "source_json", "JSON文本:", "{api_response}", height=4)
-            param_widgets['json_path'] = self.create_param_entry(parent_frame, "json_path", "提取路径:", "data.list[0].price")
-            param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "保存至变量:", "real_price")
-            param_widgets['default_value'] = self.create_param_entry(parent_frame, "default_value", "失败默认值(可选):", "")
-            param_widgets['use_default'] = self.create_param_checkbox(parent_frame, "use_default", "[OK] 提取失败时使用默认值（可为空）", default=False)
-            param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] 提取失败时停止宏", default=False)
-            self.create_hint_label(parent_frame, "* 提示: 支持 data.list[0].price、$.data.name、items[0]['title'] 等路径；勾选默认值后可留空，表示失败时保存空字符串。")
 
         elif action_key == 'PROMPT_INPUT':
             param_widgets['title'] = self.create_param_entry(parent_frame, "title", "询问窗口标题:", "智点助手人工输入")
@@ -1034,36 +1049,6 @@ def update_run_params(param_widgets, param_frame, run_type_widget):
 # ======================================================================
 # 参数转换工具函数（从 MacroMate.py 迁移）
 # ======================================================================
-def param_display_to_internal(key, display_value, ocr_name_map, lang_options, click_options):
-    """
-    将UI显示值转换为内部存储值
-
-    Args:
-        key: 参数键名 ('lang', 'button', 'engine' 等)
-        display_value: UI中显示的值
-        ocr_name_map: OCR引擎名称映射 {display_name: key}
-        lang_options: 语言选项映射 {display_name: key}
-        click_options: 点击选项映射 {display_name: key}
-
-    Returns:
-        内部存储的实际值
-    """
-    mappings = {
-        'lang': lang_options,
-        'button': click_options,
-        'engine': ocr_name_map
-    }
-
-    if key == 'engine' and display_value.endswith(" (不可用)"):
-        display_value = display_value.replace(" (不可用)", "")
-
-    mapping = mappings.get(key)
-    if mapping:
-        return mapping.get(display_value, display_value)
-
-    return display_value
-
-
 def param_internal_to_display(key, internal_value, ocr_name_map, lang_values_to_name,
                               click_values_to_name, available_ocr_keys=None):
     """
@@ -1099,17 +1084,214 @@ def param_internal_to_display(key, internal_value, ocr_name_map, lang_values_to_
     return internal_value
 
 
-# ======================================================================
-# 工具函数（从 MacroMate.py 迁移）
-# ======================================================================
-def resource_path(relative_path):
-    """获取资源文件路径，支持打包后环境"""
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_path, relative_path)
+# =================================================================
+# VLM settings dialog
+# =================================================================
+class VLMSettingsDialog:
+    # [修复 BUG-3] 恢复完整功能：load_config、测试连接、timeout 设置
+    def __init__(self, parent):
+        self.result = None
+        self._ui_callbacks = queue.Queue()
+        try:
+            import vlm_engine
+            self.current_config = vlm_engine.load_config()
+            self.providers = vlm_engine.get_providers()
+        except Exception as e:
+            logger.warning("load failed, using defaults: %s", e)
+            self.current_config = {'provider': 'openai', 'api_key': '', 'model': '', 'timeout': 30, 'base_url': ''}
+            self.providers = {}
+        self.font_ui = ("Microsoft YaHei UI", 10)
 
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.withdraw()  # 立即隐藏，防止闪烁
+        self.dialog.title("🤖 AI 配置设置")
+        self.dialog.geometry("520x660")
+        self.dialog.resizable(False, False)
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+        center_child_window(parent, self.dialog)
+        self.dialog.deiconify()  # 位置确定后再显示
+
+        self._create_ui()
+        self.dialog.after(50, self._drain_ui_callbacks)
+
+    def _create_ui(self):
+        main_frame = ttk.Frame(self.dialog, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(main_frame, text="🤖 AI 大模型配置",
+                  font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(0, 15))
+
+        # 提供商
+        provider_frame = ttk.Labelframe(main_frame, text="AI 提供商", padding=10)
+        provider_frame.pack(fill=tk.X, pady=(0, 10))
+        self.provider_var = tk.StringVar(value=self.current_config.get('provider', 'openai'))
+        provider_names = [f"{v['name']} ({k})" for k, v in self.providers.items()] if self.providers \
+            else ['openai', 'anthropic', 'deepseek', 'zhipu', 'qianwen', 'openrouter', 'step']
+        self.provider_combo = ttk.Combobox(provider_frame, values=provider_names,
+                                            state="readonly", textvariable=self.provider_var,
+                                            font=self.font_ui)
+        self.provider_combo.pack(fill=tk.X)
+        self.provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
+
+        # API Key
+        key_frame = ttk.Labelframe(main_frame, text="API Key", padding=10)
+        key_frame.pack(fill=tk.X, pady=(0, 10))
+        self.api_key_var = tk.StringVar(value=self.current_config.get('api_key', ''))
+        key_entry = ttk.Entry(key_frame, textvariable=self.api_key_var,
+                              font=self.font_ui, show="*")
+        key_entry.pack(fill=tk.X)
+        self.show_key_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(key_frame, text="显示 API Key", variable=self.show_key_var,
+                        command=lambda: key_entry.config(
+                            show="" if self.show_key_var.get() else "*")).pack(anchor="w", pady=(5, 0))
+
+        # 模型
+        model_frame = ttk.Labelframe(main_frame, text="模型 (可选)", padding=10)
+        model_frame.pack(fill=tk.X, pady=(0, 10))
+        self.model_var = tk.StringVar(value=self.current_config.get('model', ''))
+        ttk.Entry(model_frame, textvariable=self.model_var, font=self.font_ui).pack(fill=tk.X)
+        ttk.Label(model_frame, text="留空则使用默认值",
+                  font=("Microsoft YaHei UI", 8), foreground="gray").pack(anchor="w")
+
+        # 超时
+        timeout_frame = ttk.Labelframe(main_frame, text="超时时间 (秒)", padding=10)
+        timeout_frame.pack(fill=tk.X, pady=(0, 10))
+        self.timeout_var = tk.IntVar(value=self.current_config.get('timeout', 30))
+        ttk.Spinbox(timeout_frame, from_=10, to=120,
+                    textvariable=self.timeout_var, font=self.font_ui).pack(fill=tk.X)
+
+        # 按钮
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=(15, 0))
+        btn_frame.columnconfigure(0, weight=1)
+        btn_frame.columnconfigure(1, weight=1)
+        btn_frame.columnconfigure(2, weight=1)
+        ttk.Button(btn_frame, text="取消", command=self.dialog.destroy,
+                   bootstyle="secondary", padding=(10, 8)).grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ttk.Button(btn_frame, text="测试连接", command=self._test_connection,
+                   bootstyle="info", padding=(10, 8)).grid(row=0, column=1, sticky="ew", padx=3)
+        ttk.Button(btn_frame, text="保存", command=self._save,
+                   bootstyle="primary", padding=(10, 8)).grid(row=0, column=2, sticky="ew", padx=(3, 0))
+
+        ttk.Label(main_frame, text="输入 API Key，选择提供商，保存即可使用 AI 指令动作",
+                  font=("Microsoft YaHei UI", 8), foreground="#666").pack(pady=(10, 0))
+
+    def _selected_provider_key(self):
+        selected = self.provider_var.get()
+        return selected.split(" (")[-1].rstrip(")") if "(" in selected else selected
+
+    def _build_current_vlm_config(self, system_prompt=None):
+        import vlm_engine
+        provider_key = self._selected_provider_key()
+        config = vlm_engine.DEFAULT_CONFIG.copy()
+        config.update({
+            'provider': provider_key,
+            'api_key': self.api_key_var.get().strip(),
+            'timeout': self.timeout_var.get(),
+        })
+        if system_prompt is not None:
+            config['system_prompt'] = system_prompt
+        if self.model_var.get().strip():
+            config['model'] = self.model_var.get().strip()
+        if self.providers and provider_key in self.providers:
+            config['base_url'] = self.providers[provider_key].get('base_url', '')
+        return config
+
+    def _on_provider_change(self, event):
+        provider_key = self._selected_provider_key()
+        if self.providers and provider_key in self.providers:
+            default_model = self.providers[provider_key].get('model', '')
+            if not self.model_var.get():
+                self.model_var.set(default_model)
+
+    def _test_connection(self):
+        # [修复H-6] 改为后台线程执行，避免阻塞 UI 事件循环
+        try:
+            import vlm_engine, io, threading
+            api_key = self.api_key_var.get().strip()
+            if not api_key:
+                messagebox.showwarning("提示", "请先输入 API Key", parent=self.dialog)
+                return
+            config = self._build_current_vlm_config(system_prompt="你是一个助手，直接回答用户问题即可。")
+
+            # 禁用按钮并显示等待状态（UI 层立即响应）
+            self.dialog.config(cursor="watch")
+            original_states = {}
+            for child in self.dialog.winfo_children():
+                try:
+                    original_states[child] = child.cget("state")
+                    child.config(state="disabled")
+                except Exception:
+                    pass
+            self.dialog.update()
+
+            def _do_test():
+                screenshot = None
+                try:
+                    screenshot, _offset = capture_physical_bbox()
+                    buf = io.BytesIO()
+                    screenshot.save(buf, format='JPEG', quality=85)
+                    image_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+                    vlm_engine.call_vlm_api("描述你看到了什么？", image_b64=image_b64, config=config, raise_on_error=True)
+                    self._safe_dialog_after(lambda: messagebox.showinfo("成功", "API 连接成功！", parent=self.dialog))
+                except Exception as e:
+                    err = str(e)
+                    self._safe_dialog_after(lambda msg=err: messagebox.showerror("错误", f"连接失败:\n{msg}", parent=self.dialog))
+                finally:
+                    if screenshot:
+                        try: screenshot.close()
+                        except Exception: pass
+                    # 恢复 UI 状态
+                    def _restore():
+                        try:
+                            self.dialog.config(cursor="")
+                            for child in self.dialog.winfo_children():
+                                try: child.config(state=original_states.get(child, "normal"))
+                                except Exception: pass
+                        except Exception:
+                            pass
+                    self._safe_dialog_after(_restore)
+
+            threading.Thread(target=_do_test, daemon=True).start()
+
+        except Exception as e:
+            messagebox.showerror("错误", f"启动测试失败: {e}", parent=self.dialog)
+            self.dialog.config(cursor="")
+
+    def _safe_dialog_after(self, callback):
+        """Queue a UI callback without touching Tk from a worker thread."""
+        self._ui_callbacks.put(callback)
+
+    def _drain_ui_callbacks(self):
+        """Run queued callbacks on the Tk main thread."""
+        while True:
+            try:
+                callback = self._ui_callbacks.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                logger.exception("UI callback failed")
+
+        try:
+            if self.dialog.winfo_exists():
+                self.dialog.after(50, self._drain_ui_callbacks)
+        except tk.TclError:
+            pass
+
+    def _save(self):
+        try:
+            import vlm_engine
+            config = self._build_current_vlm_config()
+            if vlm_engine.save_config(config):
+                self.result = config
+                self.dialog.destroy()
+            else:
+                messagebox.showerror("错误", "保存配置失败", parent=self.dialog)
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败: {e}", parent=self.dialog)
 
 def get_icon_path(icon_name="app_icon.ico", app_version="1.8.0"):
     """
@@ -1139,7 +1321,7 @@ def get_icon_path(icon_name="app_icon.ico", app_version="1.8.0"):
         source_icon = os.path.join(sys._MEIPASS, icon_name)
 
         if not os.path.exists(source_icon):
-            print(f"[警告] 未找到打包的图标文件: {source_icon}")
+            logger.warning(f"未找到打包的图标文件: {source_icon}")
             return None
 
         # 创建临时文件
@@ -1148,10 +1330,10 @@ def get_icon_path(icon_name="app_icon.ico", app_version="1.8.0"):
 
         # 复制图标到临时目录
         shutil.copy2(source_icon, temp_icon)
-        print(f"[Info] 图标已提取到: {temp_icon}")
+        logger.info(f"图标已提取到: {temp_icon}")
 
         return temp_icon
     except Exception as e:
-        print(f"[错误] 提取图标失败: {e}")
+        logger.error(f"提取图标失败: {e}")
         return None
 

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # vlm_engine.py
 # 描述: 大模型视觉语言引擎 - 接入支持图片理解的大模型 API
-# Version: 1.1.5
+# Version: 1.1.6
 # 功能: 将屏幕截图转为 Base64，连同自然语言指令发送给 VLM API，返回坐标
 
 import base64
@@ -11,6 +11,10 @@ import sys
 import time
 import re
 import threading
+import io
+import logging
+
+logger = logging.getLogger(__name__)
 
 # 依赖库
 try:
@@ -18,9 +22,7 @@ try:
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
-    print("[VLM] FAIL 未找到 requests 库 (pip install requests)")
-
-from PIL import ImageGrab
+    logger.error("未找到 requests 库 (pip install requests)")
 
 # ======================================================================
 # 全局配置
@@ -116,26 +118,27 @@ def _read_json_file(path):
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError, TypeError) as e:
-        print(f"[VLM] 加载配置失败 ({path}): {e}")
+        logger.error("加载配置失败 (%s): %s", os.path.basename(path), e)
         return {}
 
 
 def _merge_user_config(default, user_config):
+    merged = default.copy()
     if not isinstance(user_config, dict):
-        return default
+        return merged
 
     for k, v in user_config.items():
         if v is not None:
-            default[k] = v
+            merged[k] = v
     user_has_base_url = bool(user_config.get('base_url'))
     user_has_model = bool(user_config.get('model'))
-    if default['provider'] in PROVIDER_CONFIGS:
-        pc = PROVIDER_CONFIGS[default['provider']]
+    if merged['provider'] in PROVIDER_CONFIGS:
+        pc = PROVIDER_CONFIGS[merged['provider']]
         if not user_has_base_url:
-            default['base_url'] = pc.get('base_url', DEFAULT_CONFIG['base_url'])
+            merged['base_url'] = pc.get('base_url', DEFAULT_CONFIG['base_url'])
         if not user_has_model:
-            default['model'] = pc.get('model', DEFAULT_CONFIG['model'])
-    return default
+            merged['model'] = pc.get('model', DEFAULT_CONFIG['model'])
+    return merged
 
 
 def _load_user_config():
@@ -195,7 +198,9 @@ def load_config():
 def save_config(config):
     """保存 VLM 配置（原子写入）"""
     global _vlm_config
-    with _vlm_lock:
+    from sys_utils import get_shared_file_lock
+
+    with _vlm_lock, get_shared_file_lock(APP_CONFIG_FILE):
         try:
             read_path = APP_CONFIG_FILE
             app_config = _read_json_file(read_path)
@@ -208,7 +213,7 @@ def save_config(config):
             _vlm_config = config
             return True
         except (OSError, TypeError) as e:
-            print(f"[VLM] 保存配置失败: {e}")
+            logger.error(f"保存配置失败: {e}")
             return False
 
 
@@ -223,84 +228,30 @@ def get_providers():
 def capture_screen(region=None):
     """
     截取屏幕并转为 Base64
-    
+
     Args:
         region: 可选的区域坐标 (x1, y1, x2, y2)，None 表示全屏
-        
+
     Returns:
         base64_str: Base64 编码的图片字符串
-        offset: (x_offset, y_offset) 区域左上角坐标，全屏为 (0, 0)
+        offset: (x_offset, y_offset) 区域左上角坐标
     """
     screenshot = None
     try:
-        if sys.platform == 'win32':
-            import ctypes
-            SM_XVIRTUALSCREEN = 76
-            SM_YVIRTUALSCREEN = 77
-            SM_CXVIRTUALSCREEN = 78
-            SM_CYVIRTUALSCREEN = 79
-            user32 = ctypes.windll.user32
-            vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
-            vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
-            vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
-            vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
-            
-            if region:
-                x1, y1, x2, y2 = region[0], region[1], region[2], region[3]
-                screen_w = user32.GetSystemMetrics(0)
-                screen_h = user32.GetSystemMetrics(1)
-                
-                if x1 < 0 or y1 < 0 or x2 > screen_w or y2 > screen_h or vx < 0 or vy < 0:
-                    full_screen = ImageGrab.grab(all_screens=True)
-                    try:
-                        crop_box = (x1 - vx, y1 - vy, x2 - vx, y2 - vy)
-                        cx1 = max(0, crop_box[0])
-                        cy1 = max(0, crop_box[1])
-                        cx2 = min(full_screen.width, crop_box[2])
-                        cy2 = min(full_screen.height, crop_box[3])
-                        
-                        crop_box = (cx1, cy1, cx2, cy2)
-                        screenshot = full_screen.crop(crop_box)
-                        full_screen.close()
-                        offset = (cx1 + vx, cy1 + vy)
-                    except Exception as e:
-                        try: full_screen.close()
-                        except Exception: pass
-                        raise e
-                else:
-                    screenshot = ImageGrab.grab(bbox=tuple(region))
-                    offset = (region[0], region[1])
-            else:
-                primary_w = user32.GetSystemMetrics(0)
-                primary_h = user32.GetSystemMetrics(1)
-                if vw > 0 and vh > 0 and (vx != 0 or vy != 0 or vw > primary_w or vh > primary_h):
-                    screenshot = ImageGrab.grab(all_screens=True)
-                    offset = (vx, vy)
-                else:
-                    screenshot = ImageGrab.grab()
-                    offset = (0, 0)
-        else:
-            if region:
-                screenshot = ImageGrab.grab(bbox=tuple(region))
-                offset = (region[0], region[1])
-            else:
-                screenshot = ImageGrab.grab()
-                offset = (0, 0)
-        
-        # 转为 JPEG 格式的 Base64
-        import io
-        buffer = io.BytesIO()
-        screenshot.save(buffer, format='JPEG', quality=85)
-        b64_str = base64.b64encode(buffer.getvalue()).decode('utf-8')
-        return b64_str, offset
+        from sys_utils import capture_physical_bbox
+
+        screenshot, offset = capture_physical_bbox(region)
+
+        return _encode_screenshot_pil(screenshot), offset
     except Exception as e:
-        print(f"[VLM] 截图失败: {e}")
+        logger.error(f"截图失败: {e}")
         raise RuntimeError(f"VLM screen capture failed: {e}") from e
     finally:
         if screenshot:
-            try: screenshot.close()
-            except Exception: pass
-
+            try:
+                screenshot.close()
+            except Exception:
+                pass
 
 # ======================================================================
 # 坐标解析
@@ -397,11 +348,16 @@ class _OpenAICompatibleAdapter:
 
     @staticmethod
     def parse_response(result):
+        if not isinstance(result, dict):
+            return ""
         choices = result.get('choices', [])
-        if choices:
-            msg = choices[0].get('message', {})
-            return msg.get('content', '')
-        return ""
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            return ""
+        msg = choices[0].get('message', {})
+        if not isinstance(msg, dict):
+            return ""
+        content = msg.get('content', '')
+        return content if isinstance(content, str) else ""
 
 
 class _AnthropicAdapter:
@@ -438,10 +394,13 @@ class _AnthropicAdapter:
 
     @staticmethod
     def parse_response(result):
+        if not isinstance(result, dict):
+            return ""
         content = result.get('content', [])
-        if content and isinstance(content, list):
-            return content[0].get('text', '')
-        return ""
+        if not isinstance(content, list) or not content or not isinstance(content[0], dict):
+            return ""
+        text = content[0].get('text', '')
+        return text if isinstance(text, str) else ""
 
 
 class _DeepSeekAdapter(_OpenAICompatibleAdapter):
@@ -482,7 +441,6 @@ VLM_ADAPTERS = {
 
 
 def _encode_screenshot_pil(screenshot_pil):
-    import io
     buffer = io.BytesIO()
     screenshot_pil.save(buffer, format='JPEG', quality=85)
     return base64.b64encode(buffer.getvalue()).decode('utf-8')
@@ -495,18 +453,18 @@ def _resolve_vlm_image_b64(image_b64, screenshot_pil, raise_on_error):
         return _encode_screenshot_pil(screenshot_pil)
     except Exception as e:
         err_msg = f"[VLM] FAIL image encoding failed: {e}"
-        print(err_msg)
+        logger.error(err_msg)
         if raise_on_error: raise RuntimeError(err_msg) from e
         return None
 
 
 def _validate_vlm_capability(provider, model, image_b64, raise_on_error):
     if not image_b64:
-        print("[VLM] text-only mode")
+        logger.info("text-only mode")
         return True
     if PROVIDER_CONFIGS.get(provider, {}).get('supports_vision') is False:
         msg = f"current model does not support image input: {provider}/{model}"
-        print(f"[VLM] FAIL {msg}")
+        logger.error(msg)
         if raise_on_error:
             raise ValueError(msg)
         return False
@@ -518,7 +476,7 @@ def _parse_vlm_response_json(response, raise_on_error):
         return response.json()
     except ValueError as e:
         err_msg = f"[VLM] FAIL API returned invalid JSON: {e}"
-        print(err_msg)
+        logger.error(err_msg)
         if raise_on_error: raise RuntimeError(err_msg) from e
         return None
 
@@ -527,14 +485,14 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None, 
     """Call the configured VLM API and return an (x, y) coordinate or None."""
     if not REQUESTS_AVAILABLE:
         err_msg = "[VLM] FAIL requests package is unavailable"
-        print(err_msg)
+        logger.error(err_msg)
         if raise_on_error: raise RuntimeError(err_msg)
         return None
 
     cfg = _apply_runtime_secret_config(config if config else load_config())
     if not cfg.get('api_key'):
         err_msg = "[VLM] FAIL API key is not configured"
-        print(err_msg)
+        logger.error(err_msg)
         if raise_on_error: raise ValueError(err_msg)
         return None
 
@@ -543,7 +501,7 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None, 
     timeout = cfg.get('timeout', 30)
     adapter = VLM_ADAPTERS.get(provider)
     if not adapter:
-        print(f"[VLM] FAIL unsupported provider: {provider}")
+        logger.error(f"unsupported provider: {provider}")
         return None
 
     image_b64 = _resolve_vlm_image_b64(image_b64, screenshot_pil, raise_on_error)
@@ -562,7 +520,7 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None, 
         if response.status_code != 200:
             reason = getattr(response, 'reason', '') or 'request failed'
             err_msg = f"[VLM] API returned error: {response.status_code} - {reason}"
-            print(err_msg)
+            logger.error(err_msg)
             if raise_on_error: raise RuntimeError(err_msg)
             return None
 
@@ -572,25 +530,25 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None, 
 
         text_content = adapter.parse_response(result)
         if not text_content:
-            print("[VLM] API returned empty content")
+            logger.warning("API returned empty content")
             return None
 
-        print(f"[VLM] API response ({elapsed:.2f}s): {text_content[:200]}...")
+        logger.info("API response received (%.2fs, %s chars)", elapsed, len(text_content))
         return parse_coordinates(text_content)
 
     except requests.Timeout as e:
         err_msg = f"[VLM] FAIL request timed out ({timeout}s)"
-        print(err_msg)
+        logger.error(err_msg)
         if raise_on_error: raise RuntimeError(err_msg) from e
         return None
     except requests.RequestException as e:
         err_msg = f"[VLM] FAIL request failed: {e}"
-        print(err_msg)
+        logger.error(err_msg)
         if raise_on_error: raise RuntimeError(err_msg) from e
         return None
-    except (KeyError, TypeError, IndexError) as e:
+    except (AttributeError, KeyError, TypeError, IndexError, ValueError) as e:
         err_msg = f"[VLM] FAIL malformed API response: {e}"
-        print(err_msg)
+        logger.error(err_msg)
         if raise_on_error: raise RuntimeError(err_msg) from e
         return None
 
@@ -624,29 +582,5 @@ def find_location_by_vlm(instruction, region=None, config=None):
     return coords
 
 
-# ======================================================================
-# 测试函数
-# ======================================================================
-def test_vlm():
-    """测试 VLM 引擎"""
-    config = load_config()
-    if not config.get('api_key'):
-        print("[VLM] 请先配置 API Key")
-        return
-    
-    # 测试截图
-    print("[VLM] 测试截图...")
-    b64, offset = capture_screen()
-    if b64:
-        print(f"[VLM] 截图成功, Base64 长度: {len(b64)}")
-    
-    # 测试 API
-    print("[VLM] 测试 API...")
-    coords = find_location_by_vlm("找到屏幕中任何文字按钮的中心位置")
-    if coords:
-        print(f"[VLM] 找到坐标: {coords}")
-    else:
-        print("[VLM] 未找到坐标")
 
-
-vlm_engine_version = "1.1.5"
+vlm_engine_version = "1.1.6"

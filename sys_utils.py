@@ -1,21 +1,75 @@
 # sys_utils.py
 # 描述: 系统底层工具、全局热键管理及稳定工具类集
-# 版本: 1.8.1
+# 版本: 1.8.3
 
 import sys
 import os
 import threading
+import queue
 import functools
-import base64
 import tkinter as tk
 from tkinter import ttk, messagebox
 import pyautogui
 import ctypes
-from PIL import Image, ImageTk
+from PIL import Image, ImageGrab, ImageTk
 from pynput import keyboard
 
-# 引入核心库中的工具
-from core_engine import HotkeyUtils
+import logging
+logger = logging.getLogger(__name__)
+
+
+_SHARED_FILE_LOCKS = {}
+_SHARED_FILE_LOCKS_GUARD = threading.Lock()
+
+def get_shared_file_lock(path):
+    """Return the process-wide lock used for read-modify-write file transactions."""
+    normalized = os.path.normcase(os.path.abspath(os.fspath(path)))
+    with _SHARED_FILE_LOCKS_GUARD:
+        return _SHARED_FILE_LOCKS.setdefault(normalized, threading.RLock())
+
+class HotkeyUtils:
+    PYNPUT_TO_VK = {
+        'f1': 0x70, 'f2': 0x71, 'f3': 0x72, 'f4': 0x73, 'f5': 0x74, 'f6': 0x75,
+        'f7': 0x76, 'f8': 0x77, 'f9': 0x78, 'f10': 0x79, 'f11': 0x7A, 'f12': 0x7B,
+        'a': 0x41, 'b': 0x42, 'c': 0x43, 'd': 0x44, 'e': 0x45, 'f': 0x46, 'g': 0x47,
+        'h': 0x48, 'i': 0x49, 'j': 0x4A, 'k': 0x4B, 'l': 0x4C, 'm': 0x4D, 'n': 0x4E,
+        'o': 0x4F, 'p': 0x50, 'q': 0x51, 'r': 0x52, 's': 0x53, 't': 0x54, 'u': 0x55,
+        'v': 0x56, 'w': 0x57, 'x': 0x58, 'y': 0x59, 'z': 0x5A,
+        '0': 0x30, '1': 0x31, '2': 0x32, '3': 0x33, '4': 0x34, '5': 0x35, '6': 0x36,
+        '7': 0x37, '8': 0x38, '9': 0x39,
+        'enter': 0x0D, 'space': 0x20, 'tab': 0x09, 'caps_lock': 0x14,
+        'esc': 0x1B, 'page_up': 0x21, 'page_down': 0x22, 'end': 0x23, 'home': 0x24,
+        'left': 0x25, 'up': 0x26, 'right': 0x27, 'down': 0x28, 'insert': 0x2D, 'delete': 0x2E,
+        'backspace': 0x08,
+    }
+    VK_TO_PYNPUT = {v: k for k, v in PYNPUT_TO_VK.items()}
+    
+    if sys.platform == 'win32':
+        PYNPUT_MOD_TO_WIN_MOD = {
+            'ctrl': 0x0002,  # win32con.MOD_CONTROL
+            'alt': 0x0001,   # win32con.MOD_ALT
+            'shift': 0x0004, # win32con.MOD_SHIFT
+            'cmd': 0x0008,   # win32con.MOD_WIN
+        }
+    else:
+        PYNPUT_MOD_TO_WIN_MOD = {}
+    
+    @staticmethod
+    def format_hotkey_display(hotkey_str):
+        if not hotkey_str or "录制" in hotkey_str:
+            return hotkey_str
+        try:
+            parts = hotkey_str.split('+')
+            display_parts = []
+            for part in parts:
+                if part.lower() in {'ctrl', 'alt', 'shift', 'cmd'}:
+                    display_parts.append(part.capitalize())
+                else:
+                    display_parts.append(part.upper())
+            return "+".join(display_parts)
+        except Exception:
+            return hotkey_str.upper()
+
 
 # ======================================================================
 # 1. 系统底层初始化 (DPI, 流, AppID)
@@ -37,7 +91,7 @@ def init_system_runtime():
             )
             sys.stdout.reconfigure(encoding=stdio_encoding, errors='replace')
             sys.stderr.reconfigure(encoding=stdio_encoding, errors='replace')
-            print(f"[CONFIG] STDIO encoding: {stdio_encoding}")
+            logger.info(f"STDIO encoding: {stdio_encoding}")
         except AttributeError:
             pass
             
@@ -60,9 +114,74 @@ def set_windows_app_id(app_version):
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
             return True
         except Exception as e:
-            print(f"[警告] 设置 AppUserModelID 失败: {e}")
+            logger.warning(f"设置 AppUserModelID 失败: {e}")
     return False
 
+def _get_virtual_screen_rect():
+    """Return the physical virtual-screen rectangle as (x, y, width, height)."""
+    if sys.platform != 'win32':
+        return (0, 0, 0, 0)
+
+    SM_XVIRTUALSCREEN = 76
+    SM_YVIRTUALSCREEN = 77
+    SM_CXVIRTUALSCREEN = 78
+    SM_CYVIRTUALSCREEN = 79
+    user32 = ctypes.windll.user32
+    return (
+        user32.GetSystemMetrics(SM_XVIRTUALSCREEN),
+        user32.GetSystemMetrics(SM_YVIRTUALSCREEN),
+        user32.GetSystemMetrics(SM_CXVIRTUALSCREEN),
+        user32.GetSystemMetrics(SM_CYVIRTUALSCREEN),
+    )
+
+
+def capture_physical_bbox(bbox=None):
+    """Capture a physical screen bbox and return (PIL.Image, absolute_offset)."""
+    if bbox is not None:
+        if len(bbox) != 4:
+            raise ValueError("bbox must be a 4-item (x1, y1, x2, y2) tuple")
+        x1, y1, x2, y2 = (int(v) for v in bbox)
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError("Invalid crop box geometry")
+        bbox = (x1, y1, x2, y2)
+
+    if sys.platform != 'win32':
+        if bbox is None:
+            return ImageGrab.grab(), (0, 0)
+        return ImageGrab.grab(bbox=bbox), (bbox[0], bbox[1])
+
+    vx, vy, vw, vh = _get_virtual_screen_rect()
+    user32 = ctypes.windll.user32
+
+    if bbox is None:
+        primary_w = user32.GetSystemMetrics(0)
+        primary_h = user32.GetSystemMetrics(1)
+        if vw > 0 and vh > 0 and (vx != 0 or vy != 0 or vw > primary_w or vh > primary_h):
+            return ImageGrab.grab(all_screens=True), (vx, vy)
+        return ImageGrab.grab(), (0, 0)
+
+    x1, y1, x2, y2 = bbox
+    screen_w = user32.GetSystemMetrics(0)
+    screen_h = user32.GetSystemMetrics(1)
+    needs_virtual_capture = x1 < 0 or y1 < 0 or x2 > screen_w or y2 > screen_h or vx < 0 or vy < 0
+
+    if not needs_virtual_capture:
+        return ImageGrab.grab(bbox=bbox), (x1, y1)
+
+    full_screen = ImageGrab.grab(all_screens=True)
+    try:
+        crop_x1 = max(0, x1 - vx)
+        crop_y1 = max(0, y1 - vy)
+        crop_x2 = min(full_screen.width, x2 - vx)
+        crop_y2 = min(full_screen.height, y2 - vy)
+        if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+            raise ValueError("Invalid crop box geometry")
+        return full_screen.crop((crop_x1, crop_y1, crop_x2, crop_y2)), (crop_x1 + vx, crop_y1 + vy)
+    finally:
+        try:
+            full_screen.close()
+        except Exception:
+            pass
 # ======================================================================
 # 2. 快捷键冲突检测支持
 # ======================================================================
@@ -79,11 +198,14 @@ if sys.platform == 'win32':
 # ======================================================================
 # 3. 鼠标位置追踪器 (MouseTracker)
 # ======================================================================
-def _center_child_window(parent, dialog):
+def center_child_window(parent, dialog):
     dialog.update_idletasks()
     x = parent.winfo_x() + (parent.winfo_width() - dialog.winfo_width()) // 2
     y = parent.winfo_y() + (parent.winfo_height() - dialog.winfo_height()) // 2
     dialog.geometry(f"+{x}+{y}")
+
+# Backward-compatible private alias for existing system dialogs.
+_center_child_window = center_child_window
 
 class MouseTracker:
     def __init__(self, root, tk_var):
@@ -144,19 +266,11 @@ class RegionSelector:
         h = self.master.winfo_screenheight()
         if sys.platform == 'win32':
             try:
-                SM_XVIRTUALSCREEN = 76
-                SM_YVIRTUALSCREEN = 77
-                SM_CXVIRTUALSCREEN = 78
-                SM_CYVIRTUALSCREEN = 79
-                user32 = ctypes.windll.user32
-                x_val = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
-                y_val = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
-                w_val = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
-                h_val = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+                x_val, y_val, w_val, h_val = _get_virtual_screen_rect()
                 if w_val > 0 and h_val > 0:
                     self.offset_x, self.offset_y, w, h = x_val, y_val, w_val, h_val
             except Exception as e:
-                print(f"[RegionSelector] 获取多屏几何信息失败: {e}")
+                logger.warning("获取多屏几何信息失败: %s", e)
 
         self.top = tk.Toplevel(self.master)
         ox = f"+{self.offset_x}" if self.offset_x >= 0 else str(self.offset_x)
@@ -218,6 +332,168 @@ class RegionSelector:
         self.master.wait_window(self.top)
         return self.selection
 
+def _region_preview_geometry(region, virtual_rect):
+    """Map an absolute region to clipped canvas coordinates on the virtual desktop."""
+    if not isinstance(region, (list, tuple)) or len(region) != 4:
+        raise ValueError("region must contain x1, y1, x2, y2")
+
+    x1, y1, x2, y2 = (int(value) for value in region)
+    vx, vy, vw, vh = (int(value) for value in virtual_rect)
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("region must satisfy x2 > x1 and y2 > y1")
+    if vw <= 0 or vh <= 0:
+        raise ValueError("virtual screen size is invalid")
+
+    left = max(x1, vx)
+    top = max(y1, vy)
+    right = min(x2, vx + vw)
+    bottom = min(y2, vy + vh)
+    if right <= left or bottom <= top:
+        raise ValueError("region is outside the current virtual screen")
+
+    return (left - vx, top - vy, right - vx, bottom - vy)
+
+
+def _region_preview_border_bounds(region, virtual_rect, thickness=4):
+    """Return absolute bounds for four border-only preview windows."""
+    x1, y1, x2, y2 = _region_preview_geometry(region, virtual_rect)
+    vx, vy, _vw, _vh = (int(value) for value in virtual_rect)
+    left, top = vx + x1, vy + y1
+    right, bottom = vx + x2, vy + y2
+    width, height = right - left, bottom - top
+    border = max(1, min(int(thickness), width, height))
+    return (
+        (left, top, width, border),
+        (left, bottom - border, width, border),
+        (left, top, border, height),
+        (right - border, top, border, height),
+    )
+
+
+def _set_preview_window_bounds(window, bounds):
+    """Place a border window using physical coordinates, including negative monitors."""
+    x, y, width, height = (int(value) for value in bounds)
+    x_pos = f'+{x}' if x >= 0 else str(x)
+    y_pos = f'+{y}' if y >= 0 else str(y)
+    window.geometry(f'{max(1, width)}x{max(1, height)}{x_pos}{y_pos}')
+
+    if sys.platform != 'win32':
+        return
+    try:
+        window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id()) or window.winfo_id()
+        ctypes.windll.user32.SetWindowPos(
+            hwnd,
+            -1,
+            x,
+            y,
+            max(1, width),
+            max(1, height),
+            0x0010 | 0x0040,
+        )
+    except (AttributeError, OSError, tk.TclError):
+        pass
+
+
+class RegionPreviewOverlay:
+    """Show only a red border and coordinates over the unchanged desktop."""
+
+    BORDER_COLOR = '#ff2d2d'
+    BORDER_WIDTH = 4
+
+    def __init__(self, master, region, duration_ms=1500):
+        self.master = master
+        self.region = tuple(int(value) for value in region)
+        self.duration_ms = max(250, int(duration_ms))
+        self.windows = []
+
+        virtual_rect = _get_virtual_screen_rect()
+        border_bounds = _region_preview_border_bounds(
+            self.region,
+            virtual_rect,
+            self.BORDER_WIDTH,
+        )
+        for bounds in border_bounds:
+            self._create_border_window(bounds)
+
+        self._create_coordinate_labels(border_bounds[0], border_bounds[1], virtual_rect)
+        self.top = self.windows[0]
+        self.top.after(self.duration_ms, self.close)
+
+    def _new_window(self, background):
+        window = tk.Toplevel(self.master)
+        window.withdraw()
+        window.overrideredirect(True)
+        window.configure(bg=background)
+        window.attributes('-topmost', True)
+        window.bind('<Escape>', self.close)
+        window.bind('<Button-1>', self.close)
+        self.windows.append(window)
+        return window
+
+    def _create_border_window(self, bounds):
+        window = self._new_window(self.BORDER_COLOR)
+        _set_preview_window_bounds(window, bounds)
+        window.deiconify()
+
+    def _create_coordinate_labels(self, top_border, bottom_border, virtual_rect):
+        left, top, width, border = top_border
+        _bottom_left, bottom_top, _bottom_width, _bottom_border = bottom_border
+        self._create_coordinate_label(
+            f'左上 ({self.region[0]}, {self.region[1]})',
+            left + border,
+            top + border,
+            virtual_rect,
+        )
+        self._create_coordinate_label(
+            f'右下 ({self.region[2]}, {self.region[3]})',
+            left + width - border,
+            bottom_top,
+            virtual_rect,
+            align_right=True,
+            align_bottom=True,
+        )
+
+    def _create_coordinate_label(
+        self,
+        text,
+        anchor_x,
+        anchor_y,
+        virtual_rect,
+        align_right=False,
+        align_bottom=False,
+    ):
+        vx, vy, vw, vh = virtual_rect
+        label_window = self._new_window(self.BORDER_COLOR)
+        label = tk.Label(
+            label_window,
+            text=text,
+            bg=self.BORDER_COLOR,
+            fg='white',
+            font=('Consolas', 10, 'bold'),
+            padx=6,
+            pady=2,
+        )
+        label.pack()
+        label_window.update_idletasks()
+        width = max(1, label_window.winfo_reqwidth())
+        height = max(1, label_window.winfo_reqheight())
+        label_x = anchor_x - width if align_right else anchor_x
+        label_y = anchor_y - height if align_bottom else anchor_y
+        label_x = max(vx, min(label_x, vx + vw - width))
+        label_y = max(vy, min(label_y, vy + vh - height))
+        _set_preview_window_bounds(label_window, (label_x, label_y, width, height))
+        label_window.deiconify()
+
+    def close(self, _event=None):
+        windows, self.windows = self.windows, []
+        for window in windows:
+            try:
+                if window.winfo_exists():
+                    window.destroy()
+            except tk.TclError:
+                pass
+
 # ======================================================================
 # 5. 全局热键管理器 (GlobalHotkeyManager)
 # ======================================================================
@@ -237,6 +513,9 @@ class GlobalHotkeyManager:
         self.listener = None
         self._listener_lock = threading.RLock()
         self._listener_generation = 0
+        self._callback_queue = queue.Queue()
+        self._callback_pump_active = False
+        self._callback_pump_after_id = None
         
     def start_listener(self):
         """Start or restart the global hotkey listener."""
@@ -261,12 +540,44 @@ class GlobalHotkeyManager:
                     self.listener.stop()
                     self.listener.join(timeout=0.5)
                 except Exception as e:
-                    print(f"[Hotkey] stop old listener failed: {e}")
+                    logger.error(f"stop old listener failed: {e}")
             if self.listener is old_listener:
                 self.listener = None
             self.held_keys.clear()
             threading.Thread(target=self._listener_thread, args=(generation,), daemon=True).start()
+        self._start_callback_pump()
         
+    def _start_callback_pump(self):
+        if self._callback_pump_active:
+            return
+        self._callback_pump_active = True
+        self._schedule_callback_drain()
+
+    def _schedule_callback_drain(self):
+        try:
+            self._callback_pump_after_id = self.root.after(50, self._drain_callbacks)
+        except Exception:
+            self._callback_pump_active = False
+            logger.exception("schedule callback drain failed")
+
+    def _enqueue_callback(self, callback):
+        self._callback_queue.put(callback)
+
+    def _drain_callbacks(self):
+        while True:
+            try:
+                callback = self._callback_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                logger.exception("callback failed")
+        if self._callback_pump_active:
+            self._schedule_callback_drain()
+        else:
+            self._callback_pump_after_id = None
+
     def _listener_thread(self, generation):
         try:
             listener = keyboard.Listener(
@@ -281,7 +592,7 @@ class GlobalHotkeyManager:
             listener.join()
         except Exception as e:
             msg = f"热键监听器启动失败: {e}\n\n快捷键将无法工作。请尝试重启程序。"
-            self.root.after(0, messagebox.showerror, "严重错误", msg)
+            self._enqueue_callback(lambda msg=msg: messagebox.showerror("严重错误", msg))
             
     def restart_listener(self): self.start_listener()
 
@@ -319,7 +630,7 @@ class GlobalHotkeyManager:
                         if mod not in self.held_keys:
                             self.held_keys[mod] = 1
             except Exception as e:
-                print(f"[Hotkey] check physical keys failed: {e}")
+                logger.error(f"check physical keys failed: {e}")
         return all(self.held_keys.get(m, 0) > 0 for m in required_mods)
 
     def on_press(self, key, generation=None):
@@ -337,12 +648,12 @@ class GlobalHotkeyManager:
             # 从本地缓存读取快捷键配置，避免跨线程直接调用 Tk 控件
             run_mods, run_key = self._parse_hotkey(self.run_hotkey_cache)
             if key_name == run_key and self._modifiers_satisfied(run_mods):
-                self.root.after(0, self.trigger_run)
+                self._enqueue_callback(self.trigger_run)
             stop_mods, stop_key = self._parse_hotkey(self.stop_hotkey_cache)
             if key_name == stop_key and self._modifiers_satisfied(stop_mods):
-                self.root.after(0, self.trigger_stop)
+                self._enqueue_callback(self.trigger_stop)
         except Exception as e:
-            print(f"[Hotkey] press error: {e}")
+            logger.error(f"press error: {e}")
 
     def on_release(self, key, generation=None):
         try:
@@ -353,7 +664,7 @@ class GlobalHotkeyManager:
             # [优化] 松开按键时直接清空字典中该键的状态，根治所有残留假死
             self.held_keys.pop(key_name, None)
         except Exception as e:
-            print(f"[Hotkey] release error: {e}")
+            logger.error(f"release error: {e}")
 
     @functools.lru_cache(maxsize=16)
     def _parse_hotkey(self, hotkey_str):
@@ -365,16 +676,28 @@ class GlobalHotkeyManager:
     def check_conflicts(self, show_success=True):
         if not HOTKEY_CHECK_AVAILABLE: return True
         conflicts = []
+        unavailable = []
         run_str = self.get_run_str()
-        if not self._test_register(run_str, 1):
+        run_result = self._test_register(run_str, 1)
+        if run_result is False:
             conflicts.append(f"运行快捷键 '{HotkeyUtils.format_hotkey_display(run_str)}'")
+        elif run_result is None:
+            unavailable.append(f"运行快捷键 '{HotkeyUtils.format_hotkey_display(run_str)}'")
         stop_str = self.get_stop_str()
-        if not self._test_register(stop_str, 2):
+        stop_result = self._test_register(stop_str, 2)
+        if stop_result is False:
             conflicts.append(f"停止快捷键 '{HotkeyUtils.format_hotkey_display(stop_str)}'")
+        elif stop_result is None:
+            unavailable.append(f"停止快捷键 '{HotkeyUtils.format_hotkey_display(stop_str)}'")
         if conflicts:
             msg = "检测到快捷键冲突：\n\n" + "\n".join(conflicts) + "\n\n可能已被其他程序占用。\n请修改快捷键，否则热键可能无法工作。"
+            if unavailable:
+                msg += "\n\n另有快捷键无法完成占用检测：\n" + "\n".join(unavailable)
             self.root.after(0, messagebox.showwarning, "快捷键冲突", msg)
             return False
+        if unavailable:
+            msg = "无法完成以下快捷键的占用检测：\n\n" + "\n".join(unavailable) + "\n\n快捷键仍会保存并尝试启用。"
+            self.root.after(0, messagebox.showwarning, "快捷键检测不可用", msg)
         return True
 
     def _test_register(self, hotkey_str, hotkey_id):
@@ -385,11 +708,13 @@ class GlobalHotkeyManager:
             for part in [p.strip() for p in parts]:
                 if part in HotkeyUtils.PYNPUT_MOD_TO_WIN_MOD: modifiers |= HotkeyUtils.PYNPUT_MOD_TO_WIN_MOD[part]
                 elif part in HotkeyUtils.PYNPUT_TO_VK: vk = HotkeyUtils.PYNPUT_TO_VK[part]
-            if vk is None: return True
+            if vk is None: return None
             if ctypes.windll.user32.RegisterHotKey(None, hotkey_id, modifiers, vk) == 0: return False
             ctypes.windll.user32.UnregisterHotKey(None, hotkey_id)
             return True
-        except Exception: return True
+        except Exception as e:
+            logger.error(f"conflict check unavailable for '{hotkey_str}': {e}")
+            return None
 
 # ======================================================================
 # 6. 快捷键输入控件 (HotkeyEntry)
@@ -525,12 +850,12 @@ class HotkeyEntry(ttk.Entry):
         return 'break'
 
 # ======================================================================
-# 7. 设置对话框 (Hotkey/VLM)
+# 7. 快捷键设置对话框 (Hotkey)
 # ======================================================================
 class HotkeySettingsDialog:
-    # [修复 BUG-4] 恢复快捷键格式校验；默认值修正为 ctrl+f10/ctrl+f11
+    # [修复 BUG-4] 恢复快捷键格式校验；默认值修正为 ctrl+f1/ctrl+f2
     def __init__(self, parent, run_hotkey, stop_hotkey,
-                 default_run='ctrl+f10', default_stop='ctrl+f11'):
+                 default_run='ctrl+f1', default_stop='ctrl+f2'):
         self.parent = parent
         self.default_run = default_run
         self.default_stop = default_stop
@@ -545,7 +870,6 @@ class HotkeySettingsDialog:
         self.dialog.grab_set()
 
         _center_child_window(parent, self.dialog)
-        self.dialog.deiconify()  # 位置确定后再显示
         self.dialog.deiconify()  # 位置确定后再显示
 
         self._create_ui(run_hotkey, stop_hotkey)
@@ -647,194 +971,6 @@ class HotkeySettingsDialog:
     def _on_close(self):
         self.dialog.destroy()
 
-class VLMSettingsDialog:
-    # [修复 BUG-3] 恢复完整功能：load_config、测试连接、timeout 设置
-    def __init__(self, parent):
-        self.result = None
-        try:
-            import vlm_engine
-            self.current_config = vlm_engine.load_config()
-            self.providers = vlm_engine.get_providers()
-        except Exception:
-            self.current_config = {'provider': 'openai', 'api_key': '', 'model': '', 'timeout': 30, 'base_url': ''}
-            self.providers = {}
-        self.font_ui = ("Microsoft YaHei UI", 10)
-
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.withdraw()  # 立即隐藏，防止闪烁
-        self.dialog.title("🤖 AI 配置设置")
-        self.dialog.geometry("520x660")
-        self.dialog.resizable(False, False)
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
-        _center_child_window(parent, self.dialog)
-        self.dialog.deiconify()  # 位置确定后再显示
-        self.dialog.deiconify()  # 位置确定后再显示
-
-        self._create_ui()
-
-    def _create_ui(self):
-        main_frame = ttk.Frame(self.dialog, padding=20)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(main_frame, text="🤖 AI 大模型配置",
-                  font=("Microsoft YaHei UI", 12, "bold")).pack(pady=(0, 15))
-
-        # 提供商
-        provider_frame = ttk.Labelframe(main_frame, text="AI 提供商", padding=10)
-        provider_frame.pack(fill=tk.X, pady=(0, 10))
-        self.provider_var = tk.StringVar(value=self.current_config.get('provider', 'openai'))
-        provider_names = [f"{v['name']} ({k})" for k, v in self.providers.items()] if self.providers \
-            else ['openai', 'anthropic', 'deepseek', 'zhipu', 'qianwen', 'openrouter', 'step']
-        self.provider_combo = ttk.Combobox(provider_frame, values=provider_names,
-                                            state="readonly", textvariable=self.provider_var,
-                                            font=self.font_ui)
-        self.provider_combo.pack(fill=tk.X)
-        self.provider_combo.bind("<<ComboboxSelected>>", self._on_provider_change)
-
-        # API Key
-        key_frame = ttk.Labelframe(main_frame, text="API Key", padding=10)
-        key_frame.pack(fill=tk.X, pady=(0, 10))
-        self.api_key_var = tk.StringVar(value=self.current_config.get('api_key', ''))
-        key_entry = ttk.Entry(key_frame, textvariable=self.api_key_var,
-                              font=self.font_ui, show="*")
-        key_entry.pack(fill=tk.X)
-        self.show_key_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(key_frame, text="显示 API Key", variable=self.show_key_var,
-                        command=lambda: key_entry.config(
-                            show="" if self.show_key_var.get() else "*")).pack(anchor="w", pady=(5, 0))
-
-        # 模型
-        model_frame = ttk.Labelframe(main_frame, text="模型 (可选)", padding=10)
-        model_frame.pack(fill=tk.X, pady=(0, 10))
-        self.model_var = tk.StringVar(value=self.current_config.get('model', ''))
-        ttk.Entry(model_frame, textvariable=self.model_var, font=self.font_ui).pack(fill=tk.X)
-        ttk.Label(model_frame, text="留空则使用默认值",
-                  font=("Microsoft YaHei UI", 8), foreground="gray").pack(anchor="w")
-
-        # 超时
-        timeout_frame = ttk.Labelframe(main_frame, text="超时时间 (秒)", padding=10)
-        timeout_frame.pack(fill=tk.X, pady=(0, 10))
-        self.timeout_var = tk.IntVar(value=self.current_config.get('timeout', 30))
-        ttk.Spinbox(timeout_frame, from_=10, to=120,
-                    textvariable=self.timeout_var, font=self.font_ui).pack(fill=tk.X)
-
-        # 按钮
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, pady=(15, 0))
-        btn_frame.columnconfigure(0, weight=1)
-        btn_frame.columnconfigure(1, weight=1)
-        btn_frame.columnconfigure(2, weight=1)
-        ttk.Button(btn_frame, text="取消", command=self.dialog.destroy,
-                   bootstyle="secondary", padding=(10, 8)).grid(row=0, column=0, sticky="ew", padx=(0, 3))
-        ttk.Button(btn_frame, text="测试连接", command=self._test_connection,
-                   bootstyle="info", padding=(10, 8)).grid(row=0, column=1, sticky="ew", padx=3)
-        ttk.Button(btn_frame, text="保存", command=self._save,
-                   bootstyle="primary", padding=(10, 8)).grid(row=0, column=2, sticky="ew", padx=(3, 0))
-
-        ttk.Label(main_frame, text="输入 API Key，选择提供商，保存即可使用 AI 指令动作",
-                  font=("Microsoft YaHei UI", 8), foreground="#666").pack(pady=(10, 0))
-
-    def _on_provider_change(self, event):
-        selected = self.provider_var.get()
-        provider_key = selected.split(" (")[-1].rstrip(")") if "(" in selected else selected
-        if self.providers and provider_key in self.providers:
-            default_model = self.providers[provider_key].get('model', '')
-            if not self.model_var.get():
-                self.model_var.set(default_model)
-
-    def _test_connection(self):
-        # [修复H-6] 改为后台线程执行，避免阻塞 UI 事件循环
-        try:
-            import vlm_engine, io, threading
-            selected = self.provider_var.get()
-            provider_key = selected.split(" (")[-1].rstrip(")") if "(" in selected else selected
-            api_key = self.api_key_var.get().strip()
-            if not api_key:
-                messagebox.showwarning("提示", "请先输入 API Key", parent=self.dialog)
-                return
-            config = vlm_engine.DEFAULT_CONFIG.copy()
-            config.update({'provider': provider_key, 'api_key': api_key,
-                           'timeout': self.timeout_var.get(),
-                           'system_prompt': "你是一个助手，直接回答用户问题即可。"})
-            if self.model_var.get().strip():
-                config['model'] = self.model_var.get().strip()
-            if self.providers and provider_key in self.providers:
-                config['base_url'] = self.providers[provider_key].get('base_url', '')
-
-            # 禁用按钮并显示等待状态（UI 层立即响应）
-            self.dialog.config(cursor="watch")
-            original_states = {}
-            for child in self.dialog.winfo_children():
-                try:
-                    original_states[child] = child.cget("state")
-                    child.config(state="disabled")
-                except Exception:
-                    pass
-            self.dialog.update()
-
-            def _do_test():
-                screenshot = None
-                try:
-                    from PIL import ImageGrab
-                    screenshot = ImageGrab.grab()
-                    buf = io.BytesIO()
-                    screenshot.save(buf, format='JPEG', quality=85)
-                    image_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-                    vlm_engine.call_vlm_api("描述你看到了什么？", image_b64=image_b64, config=config, raise_on_error=True)
-                    self._safe_dialog_after(lambda: messagebox.showinfo("成功", "API 连接成功！", parent=self.dialog))
-                except Exception as e:
-                    err = str(e)
-                    self._safe_dialog_after(lambda msg=err: messagebox.showerror("错误", f"连接失败:\n{msg}", parent=self.dialog))
-                finally:
-                    if screenshot:
-                        try: screenshot.close()
-                        except Exception: pass
-                    # 恢复 UI 状态
-                    def _restore():
-                        try:
-                            self.dialog.config(cursor="")
-                            for child in self.dialog.winfo_children():
-                                try: child.config(state=original_states.get(child, "normal"))
-                                except Exception: pass
-                        except Exception:
-                            pass
-                    self._safe_dialog_after(_restore)
-
-            threading.Thread(target=_do_test, daemon=True).start()
-
-        except Exception as e:
-            messagebox.showerror("错误", f"启动测试失败: {e}", parent=self.dialog)
-            self.dialog.config(cursor="")
-
-    def _safe_dialog_after(self, callback):
-        try:
-            if self.dialog.winfo_exists():
-                self.dialog.after(0, callback)
-        except Exception:
-            pass
-
-    def _save(self):
-        try:
-            import vlm_engine
-            selected = self.provider_var.get()
-            provider_key = selected.split(" (")[-1].rstrip(")") if "(" in selected else selected
-            config = vlm_engine.DEFAULT_CONFIG.copy()
-            config['provider'] = provider_key
-            config['api_key'] = self.api_key_var.get().strip()
-            config['timeout'] = self.timeout_var.get()
-            if self.model_var.get().strip():
-                config['model'] = self.model_var.get().strip()
-            if self.providers and provider_key in self.providers:
-                config['base_url'] = self.providers[provider_key].get('base_url', '')
-            if vlm_engine.save_config(config):
-                self.result = config
-                self.dialog.destroy()
-            else:
-                messagebox.showerror("错误", "保存配置失败", parent=self.dialog)
-        except Exception as e:
-            messagebox.showerror("错误", f"保存失败: {e}", parent=self.dialog)
-
 # ======================================================================
 # 8. 悬浮提示与迷你窗口 (Tooltip/MiniWindow)
 # ======================================================================
@@ -906,12 +1042,24 @@ class ImageTooltipManager:
             ttk.Label(self.tooltip, text=info_text, font=("Microsoft YaHei UI", 8)).pack()
 
         except Exception as e:
-            print(f"图片提示加载失败: {e}")
+            logger.error(f"图片提示加载失败: {e}")
 
     def _hide_tooltip(self):
         if self.tooltip:
             self.tooltip.destroy()
             self.tooltip = None
+
+def _calculate_mini_status_position(pointer, fallback_rect, virtual_rect, window_height):
+    """Return the mini window's lower-left position for the active desktop bounds."""
+    selected = fallback_rect
+    if virtual_rect is not None:
+        vx, vy, vw, vh = virtual_rect
+        px, py = pointer
+        if vw > 0 and vh > 0 and vx <= px < vx + vw and vy <= py < vy + vh:
+            selected = virtual_rect
+
+    monitor_x, monitor_y, _monitor_w, monitor_h = selected
+    return monitor_x + 10, monitor_y + max(0, monitor_h - window_height - 50)
 
 class MiniStatusWindow:
     """
@@ -929,24 +1077,21 @@ class MiniStatusWindow:
 
         window_width = 500
         window_height = 35
-        px, py = self.window.winfo_pointerxy()
+        pointer = self.window.winfo_pointerxy()
         screen_height = self.window.winfo_screenheight()
-        monitor_x = self.window.winfo_vrootx()
-        monitor_y = self.window.winfo_vrooty()
-        monitor_h = self.window.winfo_vrootheight() or screen_height
-        if sys.platform == 'win32':
-            try:
-                user32 = ctypes.windll.user32
-                vx = user32.GetSystemMetrics(76)
-                vy = user32.GetSystemMetrics(77)
-                vw = user32.GetSystemMetrics(78)
-                vh = user32.GetSystemMetrics(79)
-                if vw > 0 and vh > 0 and vx <= px < vx + vw and vy <= py < vy + vh:
-                    monitor_x, monitor_y, monitor_h = vx, vy, vh
-            except Exception:
-                pass
-        x = monitor_x + 10
-        y = monitor_y + max(0, monitor_h - window_height - 50)
+        fallback_rect = (
+            self.window.winfo_vrootx(),
+            self.window.winfo_vrooty(),
+            self.window.winfo_vrootwidth(),
+            self.window.winfo_vrootheight() or screen_height,
+        )
+        virtual_rect = _get_virtual_screen_rect() if sys.platform == 'win32' else None
+        x, y = _calculate_mini_status_position(
+            pointer,
+            fallback_rect,
+            virtual_rect,
+            window_height,
+        )
         self.window.geometry(f"{window_width}x{window_height}+{x}+{y}")
 
         main_frame = ttk.Frame(self.window, bootstyle="primary", padding=0)
@@ -1009,7 +1154,7 @@ class AboutDialog:
             try:
                 self.dialog.iconbitmap(icon_path)
             except (OSError, tk.TclError) as e:
-                print(f"[警告] 设置关于对话框图标失败: {e}")
+                logger.warning(f"设置关于对话框图标失败: {e}")
                 
         # 居中显示
         _center_child_window(parent, self.dialog)
@@ -1051,7 +1196,7 @@ class AboutDialog:
                 icon_label.image = icon_photo
                 icon_label.pack()
             except (OSError, IOError) as e:
-                print(f"[警告] 加载图标图像失败: {e}")
+                logger.warning(f"加载图标图像失败: {e}")
                 ttk.Label(icon_container, text="🔧", font=("Microsoft YaHei UI", 48)).pack()
         else:
             ttk.Label(icon_container, text="🔧", font=("Microsoft YaHei UI", 48)).pack()
@@ -1093,6 +1238,4 @@ class AboutDialog:
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Button(button_frame, text="确  定", command=self.dialog.destroy, bootstyle="primary", width=18, padding=(15, 8)).pack(anchor="center")
-
-
 
