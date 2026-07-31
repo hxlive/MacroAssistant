@@ -12,6 +12,10 @@
 
 当前版本完成了核心架构整改：屏幕定位统一由 `screen_locator.py` 管理，宏步骤状态和配置交互统一由 `step_controller.py` 管理；同时增强了运行停止、多屏坐标、搜索范围预览、OCR/图像缓存、日志诊断和打包环境兼容性。
 
+<p align="center">
+  <img src="screenshot.png" alt="MacroMate 截图" width="850">
+</p>
+
 ---
 
 ## ⚡ 核心功能
