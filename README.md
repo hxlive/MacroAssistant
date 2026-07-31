@@ -1,7 +1,6 @@
 # 智点助手 MacroMate 
 
-![Python](https://img.shields.io/badge/Python-3.8%20(Win7)%20%7C%203.10--3.12-blue.svg)
-![License](https://img.shields.io/badge/license-MIT-green.svg)
+![Python](https://img.shields.io/badge/Python-3.10--3.12-blue.svg)
 ![UI](https://img.shields.io/badge/UI-ttkbootstrap-brightgreen.svg)
 ![Automation](https://img.shields.io/badge/Automation-PyAutoGUI%20%7C%20OpenCV-orange.svg)
 
@@ -11,26 +10,55 @@
 
 无需编程经验即可通过 GUI 创建流程；复杂任务也可以使用 IF/ELSE、循环、标签跳转、变量计算、文件读写、人工输入和逐行批处理。程序同时提供命令行执行模式，便于定时任务或其他工具调用。
 
-当前版本重点增强了运行停止、多屏坐标、搜索范围预览、OCR 位置缓存、图像模板缓存、日志诊断和打包环境兼容性。
-
-<p align="center">
-  <img src="screenshot.png" alt="MacroMate 主界面" width="850">
-</p>
+当前版本完成了核心架构整改：屏幕定位统一由 `screen_locator.py` 管理，宏步骤状态和配置交互统一由 `step_controller.py` 管理；同时增强了运行停止、多屏坐标、搜索范围预览、OCR/图像缓存、日志诊断和打包环境兼容性。
 
 ---
 
 ## ⚡ 核心功能
 
-- **🛡️ 即时安全中断**：支持全局停止热键 `Ctrl+F11`、悬浮状态栏停止按钮、PyAutoGUI failsafe，以及 RUN 子进程清理。
+- **🛡️ 即时安全中断**：支持默认全局停止热键 `Ctrl+F2`、悬浮状态栏停止按钮、PyAutoGUI failsafe，以及 RUN 子进程清理。
+- **⌨️ 快速参数录入**：坐标输入支持移动鼠标后按 `F8` 自动取点；按键动作支持直接按下单键或组合键录入，并主动避让运行/停止快捷键。
 - **🔍 图像与文字识别**：支持模板图像查找、OCR 文字定位、识别结果保存到剪贴板或变量，并可用正则表达式提取字段。
 - **💼 多引擎 OCR**：集成 WinOCR、RapidOCR、Tesseract，可根据系统环境自动推荐或手动指定。
 - **🚀 增强匹配模式**：图像查找可启用多级缩放匹配，OCR 可进行放大识别，提高低分辨率或复杂界面的命中率。
 - **🧭 流程控制**：支持 IF/ELSE、普通循环、直到找到图像/文本、标签跳转、条件跳转，并带有最大跳转次数等安全阀。
 - **🔗 变量与数据流**：支持设置变量、读取文件、正则提取、JSON 提取、变量计算、人工输入，并通过 `{变量名}` 在后续步骤复用。
 - **📦 批量处理**：可从文件或变量中逐行读取账号、编号、订单、表单数据，每行执行一次完整流程。
-- **📁 RUN 安全执行**：外部命令、脚本和文件写入默认受开关控制，需在主界面明确启用后才执行。
+- **📁 RUN 安全执行**：外部命令和脚本默认受开关控制，需在主界面明确启用后才执行；文本文件写入使用独立动作和路径边界。
 - **🖥️ 多屏支持**：截图、区域选择、OCR/VLM 坐标映射支持虚拟屏幕、负坐标和上下排列副屏。
 - **🧪 调试友好**：步骤可屏蔽/启用，查找图像、查找文本和 AI 定位可在添加步骤前即时测试。
+
+---
+
+## 🧩 架构与核心文件
+
+本轮整改只新增两个生产模块，没有继续把程序拆成大量小文件。8 个核心文件的职责如下：
+
+| 文件 | 主要职责 |
+|---|---|
+| `MacroMate.py` | 应用入口、GUI 生命周期、菜单、设置、文件持久化及宏运行协调。 |
+| `core_engine.py` | `RunContext`、动作分发、控制流、变量/文件/RUN 动作及进程管理。 |
+| `screen_locator.py` | 截图、BBox、模板缓存、图像匹配、OCR/VLM 定位适配及定位会话状态。 |
+| `step_controller.py` | 步骤数据、Tree/CRUD、参数表单、编辑状态、区域选择和手工定位测试。 |
+| `gui_utils.py` | 通用 GUI 控件、动作参数表单、输入校验和设置对话框。 |
+| `sys_utils.py` | DPI、多屏物理坐标、全局热键、区域预览和系统辅助能力。 |
+| `ocr_engine.py` | WinOCR、RapidOCR、Tesseract 后端、文字匹配及 OCR 缓存。 |
+| `vlm_engine.py` | VLM 配置、图片编码、API 提供商适配和坐标解析。 |
+
+主要依赖方向：
+
+~~~text
+MacroMate
+  ├─> StepController ──> screen_locator
+  │       ├─> gui_utils
+  │       └─> sys_utils
+  └─> core_engine ─────> screen_locator
+                          ├─> ocr_engine
+                          ├─> vlm_engine
+                          └─> sys_utils
+~~~
+
+`screen_locator.py` 和 `step_controller.py` 已是正式运行依赖。复制源码、制作安装包或维护自定义 PyInstaller 配置时，不能遗漏这两个文件。步骤状态应继续由 `StepController` 单独持有，截图和定位实现也不应重新复制回 `core_engine.py`。
 
 ---
 
@@ -38,19 +66,13 @@
 
 ### 安装依赖
 
-Windows 10/11 推荐使用 Python 3.10 至 3.12：
+当前重构版使用 Python 3.12 完成开发和全量回归，支持 Python 3.10 至 3.12。若当前目录为 `Beta`，依赖文件位于上一级源码目录：
 
 ~~~powershell
-python -m pip install -r requirements.txt
+python -m pip install -r ..\requirements.txt
 ~~~
 
-Windows 7 使用 Python 3.8 和专用依赖文件：
-
-~~~powershell
-python -m pip install -r requirements_win7.txt
-~~~
-
-Windows 7 不支持 WinOCR，建议使用 RapidOCR 或 Tesseract。
+当前代码使用 Python 3.10 引入的类型语法，因此不再把 Python 3.8 / Windows 7 标记为本重构版的已验证运行环境。旧版 Windows 7 依赖文件只适用于相应历史兼容版本。
 
 ### 启动程序
 
@@ -84,17 +106,17 @@ python MacroMate.py
 
 ## 📚 动作列表
 
-动作编号以当前 v1.8.3 界面顺序为准。
+动作编号以当前 v1.8.5 界面顺序为准。
 
 | 序号 | 动作 | 说明 |
 |---:|---|---|
-| 01 | 点击鼠标 | 在当前或指定坐标点击，支持左右中键、多次点击和毫秒级点击间隔。 |
-| 02 | 移动到（绝对坐标） | 将鼠标移动到指定屏幕坐标。 |
+| 01 | 点击鼠标 | 在当前或指定坐标点击，支持 `F8` 自动取点、左右中键、多次点击和毫秒级点击间隔。 |
+| 02 | 移动到（绝对坐标） | 将鼠标移动到指定屏幕坐标，支持 `F8` 自动取点。 |
 | 03 | 相对移动 | 基于当前位置或上次定位结果移动指定偏移量。 |
 | 04 | 滚动滚轮 | 在当前位置或指定坐标滚动。 |
 | 05 | 等待 | 按毫秒暂停，并持续响应停止请求。 |
 | 06 | 输入文本 | 输入固定文本或变量内容；中文和复杂文本通过剪贴板粘贴。 |
-| 07 | 按下按键 | 模拟单键或组合键，例如 enter、ctrl+c。 |
+| 07 | 按下按键 | 点击录入框后直接按下单键或组合键，例如 enter、ctrl+c。 |
 | 08 | 激活窗口（按标题） | 按标题查找并激活窗口，可配置失败处理。 |
 | 09 | 备注 | 添加说明；以 LABEL: 或 标签: 开头时可定义跳转标签。 |
 | 10 | 查找图像 | 在全屏或指定区域查找模板，并定位到目标中心。 |
@@ -234,6 +256,8 @@ x1, y1, x2, y2
 
 RapidOCR 的依赖类会在模块加载阶段导入。不要将它改成首次 OCR 时再导入，否则部分 Windows 或打包环境可能出现 ONNX Runtime DLL 初始化失败。
 
+图片、OCR、条件查找、循环条件和 AI 指令最终都通过 `screen_locator.py` 的统一定位契约执行。正常“未找到”、截图失败和后端异常会分别处理，避免把环境故障误判成普通未命中。
+
 ### OCR 位置缓存
 
 OCR 成功后会在内存中记录目标位置和成功引擎。再次执行相同宏步骤时先截取上次位置附近的小区域复核；失败后扩大区域，仍失败则回退到全屏或指定范围搜索并更新缓存。
@@ -256,6 +280,7 @@ AI 自然语言指令会把截图发送给配置的 VLM，并解析返回坐标�
 - 截图可能包含敏感信息，使用在线模型前请确认数据边界。
 - 不支持视觉的模型不能用于截图定位。
 - VLM 日志会限制原始响应和错误正文的输出。
+- 取消 AI 定位后不会强杀底层 HTTP 线程，但同一时间只允许一个尚未结束的 VLM 定位请求，避免连续取消造成后台线程堆积。
 
 ---
 
@@ -271,6 +296,8 @@ AI 自然语言指令会把截图发送给配置的 VLM，并解析返回坐标�
 - 停止宏或关闭程序时会清理已登记的外部子进程。
 
 **写入文本文件** 是独立动作，不受 RUN 开关控制，但仍受路径边界、允许扩展名和错误处理规则保护。
+
+历史 `RUN file` 已禁用。读取内容请使用“读取文本文件到变量”，写入内容请使用“写入文本文件”，批量读取请使用“批量处理文本行”。
 
 ---
 
@@ -302,29 +329,6 @@ CLI 支持 GUI 保存的 {"steps": [...]} 格式，也兼容直接保存的步�
 
 ---
 
-## 🧪 调试、测试与打包
-
-建议先单独测试图像、OCR 或 AI 定位，再预览搜索范围，之后加入点击、输入、IF、循环、文件和 RUN。
-
-开发者可运行完整 Beta 预检：
-
-~~~powershell
-python .\Beta\run_preflight_tests.py
-~~~
-
-预检包括编译、编码扫描、单元测试、CLI、GUI、配置保存、样例宏和动作矩阵。目前测试集包含 221 项测试，另有 1 项按环境条件跳过。
-
-打包前建议清理旧缓存：
-
-~~~powershell
-Remove-Item .\build, .\dist, .\__pycache__ -Recurse -Force -ErrorAction SilentlyContinue
-pyinstaller --clean .\MacroMate.spec
-~~~
-
-旧 build 或 __pycache__ 可能让 PyInstaller 误用过期模块。
-
----
-
 ## ⚠️ 注意事项
 
 - 自动化会真实控制鼠标和键盘，请先在安全环境测试。
@@ -332,6 +336,7 @@ pyinstaller --clean .\MacroMate.spec
 - 长时间原生 OCR/DLL 调用可能无法在请求停止的瞬间退出。
 - GOTO、循环和批量处理均有安全限制，请避免无穷流程。
 - 启用 RUN 或在线 VLM 前确认命令、脚本和数据来源可信。
+- 部署源码或维护自定义打包脚本时，必须包含 `screen_locator.py` 和 `step_controller.py`。
 
 ---
 

@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 # vlm_engine.py
-# 描述: 大模型视觉语言引擎 - 接入支持图片理解的大模型 API
-# Version: 1.1.6
-# 功能: 将屏幕截图转为 Base64，连同自然语言指令发送给 VLM API，返回坐标
+# 功能说明：视觉语言模型接口，负责配置管理、屏幕编码、API 适配与坐标解析
+# Version: 1.8.5
+# 处理流程：将屏幕截图编码为 Base64，随自然语言指令发送给模型并解析目标坐标
 
 import base64
+import copy
 import json
 import os
 import sys
@@ -174,52 +175,56 @@ def _apply_runtime_secret_config(cfg):
 # 配置管理
 # ======================================================================
 def load_config():
-    """加载 VLM 配置"""
+    """加载 VLM 配置并返回与全局缓存隔离的副本。"""
     global _vlm_config
-    if _vlm_config is not None:
-        return _vlm_config
-    
     with _vlm_lock:
-        if _vlm_config is not None:
-            return _vlm_config
-        
-        default = DEFAULT_CONFIG.copy()
-        # 尝试从提供商配置获取默认值
-        provider = default.get('provider', 'openai')
-        if provider in PROVIDER_CONFIGS:
-            pc = PROVIDER_CONFIGS[provider]
-            default['base_url'] = pc.get('base_url', DEFAULT_CONFIG['base_url'])
-            default['model'] = pc.get('model', DEFAULT_CONFIG['model'])
-
-        _vlm_config = _merge_user_config(default, _load_user_config())
-        return _vlm_config
+        if _vlm_config is None:
+            default = DEFAULT_CONFIG.copy()
+            provider = default.get('provider', 'openai')
+            if provider in PROVIDER_CONFIGS:
+                pc = PROVIDER_CONFIGS[provider]
+                default['base_url'] = pc.get('base_url', DEFAULT_CONFIG['base_url'])
+                default['model'] = pc.get('model', DEFAULT_CONFIG['model'])
+            _vlm_config = _merge_user_config(default, _load_user_config())
+        return copy.deepcopy(_vlm_config)
 
 
 def save_config(config):
-    """保存 VLM 配置（原子写入）"""
+    """保存 VLM 配置（原子写入），不保留调用方的可变对象。"""
     global _vlm_config
     from sys_utils import get_shared_file_lock
 
+    if not isinstance(config, dict):
+        logger.error("保存配置失败: VLM config must be a dictionary")
+        return False
+
+    tmp_path = APP_CONFIG_FILE + '.tmp'
     with _vlm_lock, get_shared_file_lock(APP_CONFIG_FILE):
         try:
+            config_copy = copy.deepcopy(config)
             read_path = APP_CONFIG_FILE
             app_config = _read_json_file(read_path)
-            app_config[VLM_CONFIG_KEY] = config
+            app_config[VLM_CONFIG_KEY] = config_copy
             os.makedirs(os.path.dirname(APP_CONFIG_FILE), exist_ok=True)
-            tmp_path = APP_CONFIG_FILE + '.tmp'
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(app_config, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, APP_CONFIG_FILE)
-            _vlm_config = config
+            _vlm_config = copy.deepcopy(config_copy)
             return True
-        except (OSError, TypeError) as e:
+        except Exception as e:
+            try:
+                os.remove(tmp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.debug("Failed to clean VLM config temp file", exc_info=True)
             logger.error(f"保存配置失败: {e}")
             return False
 
 
 def get_providers():
-    """获取支持的提供商列表"""
-    return PROVIDER_CONFIGS
+    """获取支持的提供商列表副本。"""
+    return copy.deepcopy(PROVIDER_CONFIGS)
 
 
 # ======================================================================
@@ -277,7 +282,7 @@ def parse_coordinates(response_text):
     text = response_text.strip().lower()
     
     # 检查无结果标记
-    if 'none' in text or '找不到' in text or '未找到' in text or '无法' in text:
+    if re.search(r'\bnone\b', text) or '找不到' in text or '未找到' in text or '无法' in text:
         return None
     
     for pattern in _COORDINATE_PATTERNS:
@@ -489,19 +494,33 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None, 
         if raise_on_error: raise RuntimeError(err_msg)
         return None
 
-    cfg = _apply_runtime_secret_config(config if config else load_config())
+    try:
+        source_config = config if config is not None else load_config()
+        if not isinstance(source_config, dict):
+            raise TypeError("VLM config must be a dictionary")
+        cfg = _apply_runtime_secret_config(source_config)
+        provider = cfg.get('provider', 'openai')
+        adapter = VLM_ADAPTERS.get(provider)
+    except (AttributeError, KeyError, TypeError, IndexError, ValueError) as e:
+        err_msg = f"[VLM] FAIL invalid configuration: {e}"
+        logger.error(err_msg)
+        if raise_on_error:
+            raise RuntimeError(err_msg) from e
+        return None
+
     if not cfg.get('api_key'):
         err_msg = "[VLM] FAIL API key is not configured"
         logger.error(err_msg)
         if raise_on_error: raise ValueError(err_msg)
         return None
 
-    provider = cfg.get('provider', 'openai')
     model = cfg.get('model', '')
     timeout = cfg.get('timeout', 30)
-    adapter = VLM_ADAPTERS.get(provider)
     if not adapter:
-        logger.error(f"unsupported provider: {provider}")
+        err_msg = f"unsupported provider: {provider}"
+        logger.error(err_msg)
+        if raise_on_error:
+            raise ValueError(err_msg)
         return None
 
     image_b64 = _resolve_vlm_image_b64(image_b64, screenshot_pil, raise_on_error)
@@ -510,7 +529,14 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None, 
     if not _validate_vlm_capability(provider, model, image_b64, raise_on_error):
         return None
 
-    url, headers, payload = adapter.build_request(instruction, image_b64, cfg)
+    try:
+        url, headers, payload = adapter.build_request(instruction, image_b64, cfg)
+    except (AttributeError, KeyError, TypeError, IndexError, ValueError) as e:
+        err_msg = f"[VLM] FAIL invalid request configuration: {e}"
+        logger.error(err_msg)
+        if raise_on_error:
+            raise RuntimeError(err_msg) from e
+        return None
 
     try:
         t0 = time.time()
@@ -530,7 +556,10 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None, 
 
         text_content = adapter.parse_response(result)
         if not text_content:
-            logger.warning("API returned empty content")
+            err_msg = "[VLM] FAIL API returned empty or malformed content"
+            logger.warning(err_msg)
+            if raise_on_error:
+                raise RuntimeError(err_msg)
             return None
 
         logger.info("API response received (%.2fs, %s chars)", elapsed, len(text_content))
@@ -555,7 +584,10 @@ def call_vlm_api(instruction, image_b64=None, screenshot_pil=None, config=None, 
 
 def find_location_by_vlm(instruction, region=None, config=None):
     """
-    查找目标位置 (主入口函数)
+    同步兼容定位入口。
+
+    新的宏执行流程应通过 screen_locator.locate() 调用，以获得统一的取消检测、
+    截图复用和定位策略。本函数保留给独立同步调用及旧接口兼容使用。
     
     Args:
         instruction: 自然语言指令
@@ -580,7 +612,3 @@ def find_location_by_vlm(instruction, region=None, config=None):
         return (abs_x, abs_y)
     
     return coords
-
-
-
-vlm_engine_version = "1.1.6"

@@ -1,12 +1,12 @@
+# -*- coding: utf-8 -*-
 # sys_utils.py
-# 描述: 系统底层工具、全局热键管理及稳定工具类集
-# 版本: 1.8.3
+# 功能说明：系统适配工具，负责 DPI、屏幕区域、全局热键及桌面辅助窗口
+# 版本: 1.8.5
 
 import sys
 import os
 import threading
 import queue
-import functools
 import tkinter as tk
 from tkinter import ttk, messagebox
 import pyautogui
@@ -20,6 +20,14 @@ logger = logging.getLogger(__name__)
 
 _SHARED_FILE_LOCKS = {}
 _SHARED_FILE_LOCKS_GUARD = threading.Lock()
+
+def _parse_hotkey_str(hotkey_str):
+    """Parse a hotkey string without retaining manager instances in a cache."""
+    if not hotkey_str:
+        return set(), ""
+    parts = [part.strip() for part in hotkey_str.lower().split('+')]
+    return set(parts[:-1]), parts[-1]
+
 
 def get_shared_file_lock(path):
     """Return the process-wide lock used for read-modify-write file transactions."""
@@ -54,6 +62,97 @@ class HotkeyUtils:
     else:
         PYNPUT_MOD_TO_WIN_MOD = {}
     
+    @staticmethod
+    def is_valid_hotkey(hotkey):
+        """Return whether a normalized hotkey has one base key and unique modifiers."""
+        if not isinstance(hotkey, str):
+            return False
+        parts = [part.strip().lower() for part in hotkey.split('+')]
+        if not parts or any(not part for part in parts):
+            return False
+        if len(parts) == 1:
+            key = parts[0]
+            return (
+                len(key) == 1 and 'a' <= key <= 'z'
+                or key.startswith('f') and key[1:].isdigit()
+                and int(key[1:]) in range(1, 13)
+            )
+        modifiers = parts[:-1]
+        if len(set(modifiers)) != len(modifiers):
+            return False
+        if any(modifier not in {'ctrl', 'alt', 'shift', 'cmd'} for modifier in modifiers):
+            return False
+        return parts[-1] in HotkeyUtils.PYNPUT_TO_VK
+
+    ACTION_KEY_MODIFIERS = frozenset({'ctrl', 'alt', 'shift', 'win'})
+    _ACTION_KEY_ALIASES = {
+        'cmd': 'win', 'command': 'win', 'cmd_l': 'win', 'cmd_r': 'win',
+        'win_l': 'win', 'win_r': 'win', 'super_l': 'win', 'super_r': 'win', 'meta_l': 'win', 'meta_r': 'win',
+        'page_up': 'pageup', 'prior': 'pageup',
+        'page_down': 'pagedown', 'next': 'pagedown',
+        'caps_lock': 'capslock', 'num_lock': 'numlock',
+        'scroll_lock': 'scrolllock', 'escape': 'esc', 'return': 'enter',
+        'grave': '`', 'quoteleft': '`', 'asciitilde': '`',
+        'minus': '-', 'equal': '=',
+        'bracketleft': '[', 'bracketright': ']', 'backslash': '\\',
+        'semicolon': ';', 'apostrophe': "'", 'comma': ',', 'period': '.', 'slash': '/',
+        'kp_0': 'num0', 'kp_insert': 'num0',
+        'kp_1': 'num1', 'kp_end': 'num1',
+        'kp_2': 'num2', 'kp_down': 'num2',
+        'kp_3': 'num3', 'kp_next': 'num3',
+        'kp_4': 'num4', 'kp_left': 'num4',
+        'kp_5': 'num5', 'kp_begin': 'num5',
+        'kp_6': 'num6', 'kp_right': 'num6',
+        'kp_7': 'num7', 'kp_home': 'num7',
+        'kp_8': 'num8', 'kp_up': 'num8',
+        'kp_9': 'num9', 'kp_prior': 'num9',
+        'kp_add': 'add', 'kp_subtract': 'subtract',
+        'kp_multiply': 'multiply', 'kp_divide': 'divide',
+        'kp_decimal': 'decimal', 'kp_delete': 'decimal',
+        'kp_separator': 'separator', 'kp_enter': 'enter',
+    }
+
+    @staticmethod
+    def normalize_action_key_name(key_name):
+        key_name = str(key_name or '').strip().lower()
+        return HotkeyUtils._ACTION_KEY_ALIASES.get(key_name, key_name)
+
+    @staticmethod
+    def normalize_key_chord(key_chord):
+        """Return the stable pyautogui spelling used by PRESS_KEY."""
+        if not isinstance(key_chord, str):
+            return ''
+        parts = [
+            HotkeyUtils.normalize_action_key_name(part)
+            for part in key_chord.split('+')
+            if part.strip()
+        ]
+        base_keys = [part for part in parts if part not in HotkeyUtils.ACTION_KEY_MODIFIERS]
+        if len(parts) == 1 and not base_keys:
+            return parts[0]
+        if len(base_keys) != 1:
+            return '+'.join(parts)
+        order = {'ctrl': 0, 'alt': 1, 'shift': 2, 'win': 3}
+        ordered_modifiers = sorted(
+            {part for part in parts if part in HotkeyUtils.ACTION_KEY_MODIFIERS},
+            key=lambda part: order[part],
+        )
+        return '+'.join((*ordered_modifiers, base_keys[0]))
+
+    @staticmethod
+    def is_valid_key_chord(key_chord):
+        """Return whether pyautogui can execute the captured PRESS_KEY chord."""
+        normalized = HotkeyUtils.normalize_key_chord(key_chord)
+        parts = normalized.split('+') if normalized else []
+        if len(parts) == 1 and parts[0] in HotkeyUtils.ACTION_KEY_MODIFIERS:
+            return True
+        return bool(
+            parts
+            and parts[-1] in pyautogui.KEYBOARD_KEYS
+            and all(part in HotkeyUtils.ACTION_KEY_MODIFIERS for part in parts[:-1])
+        )
+
+
     @staticmethod
     def format_hotkey_display(hotkey_str):
         if not hotkey_str or "录制" in hotkey_str:
@@ -516,9 +615,13 @@ class GlobalHotkeyManager:
         self._callback_queue = queue.Queue()
         self._callback_pump_active = False
         self._callback_pump_after_id = None
+        self._is_shutdown = False
+        self._key_recording_active = threading.Event()
+        self._coordinate_capture_callback = None
         
     def start_listener(self):
         """Start or restart the global hotkey listener."""
+        self._is_shutdown = False
         # Read Tk-backed hotkey values on the main thread before listener callbacks use them.
         try:
             run_cache = self.get_run_str()
@@ -578,6 +681,40 @@ class GlobalHotkeyManager:
         else:
             self._callback_pump_after_id = None
 
+    def shutdown(self):
+        """Stop listener and Tk callback resources; safe to call repeatedly."""
+        with self._listener_lock:
+            if self._is_shutdown:
+                return
+            self._is_shutdown = True
+            self._listener_generation += 1
+            listener = self.listener
+            self.listener = None
+            self.held_keys.clear()
+            self._key_recording_active.clear()
+            self._coordinate_capture_callback = None
+
+        self._callback_pump_active = False
+        after_id = self._callback_pump_after_id
+        self._callback_pump_after_id = None
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                logger.debug("cancel hotkey callback pump failed", exc_info=True)
+
+        if listener is not None:
+            try:
+                listener.stop()
+                listener.join(timeout=0.5)
+            except Exception:
+                logger.exception("stop hotkey listener failed")
+
+        while True:
+            try:
+                self._callback_queue.get_nowait()
+            except queue.Empty:
+                break
     def _listener_thread(self, generation):
         try:
             listener = keyboard.Listener(
@@ -633,6 +770,19 @@ class GlobalHotkeyManager:
                 logger.error(f"check physical keys failed: {e}")
         return all(self.held_keys.get(m, 0) > 0 for m in required_mods)
 
+    def set_key_recording_active(self, active):
+        """Temporarily suppress run/stop callbacks while a PRESS_KEY field records."""
+        if active:
+            self._key_recording_active.set()
+        else:
+            self._key_recording_active.clear()
+
+    def set_coordinate_capture(self, callback):
+        """Set or clear the main-thread callback used by temporary F8 capture."""
+        self._coordinate_capture_callback = callback
+
+
+
     def on_press(self, key, generation=None):
         try:
             if generation is not None and generation != self._listener_generation:
@@ -645,13 +795,30 @@ class GlobalHotkeyManager:
                 return
                 
             self.held_keys[key_name] = 1
+            if self._key_recording_active.is_set():
+                return
             # 从本地缓存读取快捷键配置，避免跨线程直接调用 Tk 控件
-            run_mods, run_key = self._parse_hotkey(self.run_hotkey_cache)
+            run_mods, run_key = _parse_hotkey_str(self.run_hotkey_cache)
             if key_name == run_key and self._modifiers_satisfied(run_mods):
                 self._enqueue_callback(self.trigger_run)
-            stop_mods, stop_key = self._parse_hotkey(self.stop_hotkey_cache)
+                return
+            stop_mods, stop_key = _parse_hotkey_str(self.stop_hotkey_cache)
             if key_name == stop_key and self._modifiers_satisfied(stop_mods):
                 self._enqueue_callback(self.trigger_stop)
+                return
+
+            coordinate_callback = self._coordinate_capture_callback
+            if key_name == 'f8' and coordinate_callback is not None:
+                self._modifiers_satisfied(set())
+                active_modifiers = {'ctrl', 'alt', 'shift', 'cmd'} & self.held_keys.keys()
+                if active_modifiers:
+                    return
+                point = pyautogui.position()
+                x, y = int(point[0]), int(point[1])
+                self._enqueue_callback(
+                    lambda callback=coordinate_callback, px=x, py=y: callback(px, py)
+                )
+                return
         except Exception as e:
             logger.error(f"press error: {e}")
 
@@ -665,13 +832,6 @@ class GlobalHotkeyManager:
             self.held_keys.pop(key_name, None)
         except Exception as e:
             logger.error(f"release error: {e}")
-
-    @functools.lru_cache(maxsize=16)
-    def _parse_hotkey(self, hotkey_str):
-        if not hotkey_str: return set(), ""
-        parts = [p.strip() for p in hotkey_str.lower().split('+')]
-        if not parts: return set(), ""
-        return set(parts[:-1]), parts[-1]
 
     def check_conflicts(self, show_success=True):
         if not HOTKEY_CHECK_AVAILABLE: return True
@@ -720,6 +880,39 @@ class GlobalHotkeyManager:
 # 6. 快捷键输入控件 (HotkeyEntry)
 # ======================================================================
 class HotkeyEntry(ttk.Entry):
+    _IGNORED_KEY_NAMES = frozenset({
+        'caps_lock', 'num_lock', 'scroll_lock', 'next', 'prior', '??',
+    })
+    _MODIFIER_KEY_NAMES = {
+        'shift_l': 'shift', 'shift_r': 'shift',
+        'control_l': 'ctrl', 'control_r': 'ctrl',
+        'alt_l': 'alt', 'alt_r': 'alt', 'alt_gr': 'alt',
+        'command': 'cmd', 'command_l': 'cmd', 'command_r': 'cmd',
+        'win': 'cmd', 'win_l': 'cmd', 'win_r': 'cmd',
+    }
+    _CHAR_TO_BASE_KEY = {
+        '!': '1', '@': '2', '#': '3', '$': '4', '%': '5',
+        '^': '6', '&': '7', '*': '8', '(': '9', ')': '0',
+        '_': '-', '+': '=', '{': '[', '}': ']', '|': '\\',
+        ':': ';', '"': "'", '<': ',', '>': '.', '?': '/', '~': '`',
+        '！': '1', '＠': '2', '＃': '3', '￥': '4', '％': '5',
+        '……': '6', '…': '6', '＆': '7', '＊': '8', '（': '9', '）': '0',
+        '—': '-', '＋': '=', '【': '[', '】': ']', '、': '\\', '｜': '\\',
+        '；': ';', '：': ';', '‘': "'", '’': "'", '“': "'", '”': "'",
+        '，': ',', '《': ',', '。': '.', '》': '.', '？': '/',
+        '·': '`', '～': '`',
+    }
+    _SHIFTED_KEY_NAMES = {
+        'exclam': '1', 'at': '2', 'numbersign': '3', 'dollar': '4',
+        'percent': '5', 'asciicircum': '6', 'ampersand': '7',
+        'asterisk': '8', 'parenleft': '9', 'parenright': '0',
+        'underscore': '-', 'plus': '=', 'braceleft': '[', 'braceright': ']',
+        'bar': '\\', 'colon': ';', 'quotedbl': "'", 'less': ',',
+        'greater': '.', 'question': '/', 'yen': '4',
+    }
+    _HOTKEY_DISPLAY_ORDER = {'ctrl': 0, 'alt': 1, 'shift': 2, 'cmd': 3}
+
+
     def __init__(self, master, hotkey_var, **kwargs):
         super().__init__(master, **kwargs)
         self.hotkey_var = hotkey_var
@@ -773,83 +966,207 @@ class HotkeyEntry(ttk.Entry):
             self._display_text.set(self._placeholder)
             self.config(bootstyle="secondary")
 
-    def _on_key(self, event):
-        if not self._is_recording: return
-        key = event.keysym.lower()
+    @classmethod
+    def _normalize_event_key(cls, event):
+        key = str(getattr(event, 'keysym', '')).lower()
+        keycode = getattr(event, 'keycode', None)
+        if sys.platform == 'win32' and keycode and keycode != 229:
+            key = HotkeyUtils.VK_TO_PYNPUT.get(keycode, key)
 
-        # [终极杀手锏 2.0] 彻底解决中文输入法拦截问题
-        # 在 Windows 中文输入法下，所有按键的 keycode 会被系统统一接管为 229 (VK_PROCESSKEY)
-        if sys.platform == 'win32' and getattr(event, 'keycode', None):
-            if event.keycode != 229:
-                # 英文状态下，直接使用底层硬件码，100% 准确
-                vk_key = HotkeyUtils.VK_TO_PYNPUT.get(event.keycode)
-                if vk_key: key = vk_key
-
-        # 统一修饰键名称
-        if key in ('shift_l', 'shift_r'): key = 'shift'
-        elif key in ('control_l', 'control_r'): key = 'ctrl'
-        elif key in ('alt_l', 'alt_r', 'alt_gr'): key = 'alt'
-        elif key in ('command', 'command_l', 'command_r', 'win', 'win_l', 'win_r'): key = 'cmd'
-        
-        # [输入法抢救逻辑] 针对输入法拦截 (keycode=229) 或 Tkinter 解析失败 (??) 的情况
-        char = getattr(event, 'char', '').lower()
-        if key == '??' or getattr(event, 'keycode', None) == 229:
-            # 全角/半角符号反向映射表 (包含中文特有符号)
-            CHAR_TO_BASE = {
-                '!': '1', '@': '2', '#': '3', '$': '4', '%': '5',
-                '^': '6', '&': '7', '*': '8', '(': '9', ')': '0',
-                '_': '-', '+': '=', '{': '[', '}': ']', '|': '\\',
-                ':': ';', '"': "'", '<': ',', '>': '.', '?': '/', '~': '`',
-                '！': '1', '＠': '2', '＃': '3', '￥': '4', '％': '5',
-                '……': '6', '…': '6', '＆': '7', '＊': '8', '（': '9', '）': '0',
-                '—': '-', '＋': '=', '【': '[', '】': ']', '、': '\\', '｜': '\\',
-                '；': ';', '：': ';', '‘': "'", '’': "'", '“': "'", '”': "'",
-                '，': ',', '《': ',', '。': '.', '》': '.', '？': '/',
-                '·': '`', '～': '`'
-            }
-            if char in CHAR_TO_BASE:
-                key = CHAR_TO_BASE[char]
-            elif char and len(char) == 1 and (char.isalnum() or char in "`-=[]\\;',./"):
+        key = cls._MODIFIER_KEY_NAMES.get(key, key)
+        char = str(getattr(event, 'char', '') or '').lower()
+        if key == '??' or keycode == 229:
+            if char in cls._CHAR_TO_BASE_KEY:
+                key = cls._CHAR_TO_BASE_KEY[char]
+            elif len(char) == 1 and (char.isalnum() or char in "`-=[]\\;',./"):
                 key = char
+        return cls._SHIFTED_KEY_NAMES.get(key, key)
 
-        # 兜底：处理 Tkinter 在英文下解析出的特定符号名
-        SHIFT_MAP = {
-            'exclam': '1', 'at': '2', 'numbersign': '3', 'dollar': '4', 'percent': '5',
-            'asciicircum': '6', 'ampersand': '7', 'asterisk': '8', 'parenleft': '9', 'parenright': '0',
-            'underscore': '-', 'plus': '=', 'braceleft': '[', 'braceright': ']', 'bar': '\\',
-            'colon': ';', 'quotedbl': "'", 'less': ',', 'greater': '.', 'question': '/',
-            'yen': '4'  # 特殊补充
-        }
-        if key in SHIFT_MAP: key = SHIFT_MAP[key]
+    @staticmethod
+    def _event_modifier_keys(event):
+        modifiers = set()
+        state = getattr(event, 'state', 0)
+        if state & 0x0001:
+            modifiers.add('shift')
+        if state & 0x0004:
+            modifiers.add('ctrl')
+        if sys.platform == 'darwin':
+            if state & 0x0008:
+                modifiers.add('cmd')
+            if state & 0x0010:
+                modifiers.add('alt')
+        elif state & 0x20000:
+            modifiers.add('alt')
+        return modifiers
 
+    def _store_hotkey(self, key, event):
         self._pressed_keys.clear()
-
-        # 1. 添加当前按下的主键 (绝对排除掉输入法引发的 '??' 乱码)
-        if key and key not in ('caps_lock', 'num_lock', 'scroll_lock', 'next', 'prior', '??'):
-             self._pressed_keys.add(key)
-
-        # 2. 根据 event.state 添加当前正被按住的修饰键
-        is_mac = sys.platform == 'darwin'
-        if event.state & 0x0001: self._pressed_keys.add('shift')
-        if event.state & 0x0004: self._pressed_keys.add('ctrl')
-        
-        if is_mac:
-            if event.state & 0x0008: self._pressed_keys.add('cmd')
-            if event.state & 0x0010: self._pressed_keys.add('alt')
-        else:
-            if event.state & 0x20000: self._pressed_keys.add('alt')
-
-        # 3. 排序并显示
-        order = {'ctrl': 0, 'alt': 1, 'shift': 2, 'cmd': 3}
-        sorted_keys = sorted(list(self._pressed_keys), key=lambda k: (order.get(k, 4), k))
-        
+        if key and key not in self._IGNORED_KEY_NAMES:
+            self._pressed_keys.add(key)
+        self._pressed_keys.update(self._event_modifier_keys(event))
+        sorted_keys = sorted(
+            self._pressed_keys,
+            key=lambda item: (self._HOTKEY_DISPLAY_ORDER.get(item, 4), item),
+        )
         if sorted_keys:
             hotkey_str = '+'.join(sorted_keys)
             self.hotkey_var.set(hotkey_str)
             self._display_text.set(HotkeyUtils.format_hotkey_display(hotkey_str))
+
+    def _on_key(self, event):
+        if not self._is_recording:
+            return None
+        self._store_hotkey(self._normalize_event_key(event), event)
+        return 'break'
+# ======================================================================
+
+
+class ActionKeyEntry(HotkeyEntry):
+    """PRESS_KEY parameter widget that records one key or key chord."""
+
+    _MODIFIER_KEYS = HotkeyUtils.ACTION_KEY_MODIFIERS
+    _DISPLAY_ORDER = {'ctrl': 0, 'alt': 1, 'shift': 2, 'win': 3}
+
+    def __init__(
+            self,
+            master,
+            initial_value='enter',
+            on_recording_change=None,
+            validate_capture=None,
+            on_capture_error=None,
+            **kwargs):
+        self._value_var = tk.StringVar(
+            value=HotkeyUtils.normalize_key_chord(initial_value)
+        )
+        self._on_recording_change = on_recording_change or (lambda _active: None)
+        self._validate_capture = validate_capture or (lambda _value: None)
+        self._on_capture_error = on_capture_error or (lambda _message: None)
+        super().__init__(master, self._value_var, **kwargs)
+        self._placeholder = "点击此处，按下要录入的按键..."
+        self.bind('<Button-1>', self._on_click, add='+')
+        self.bind('<Destroy>', self._on_destroy, add='+')
+        self.refresh_display()
+
+        self.bind('<KeyRelease>', self._on_key_release, add='+')
+    def _set_recording(self, active):
+        active = bool(active)
+        if self._is_recording == active:
+            return
+        self._is_recording = active
+        self._pressed_keys.clear()
+        self._on_recording_change(active)
+
+    def _begin_recording(self, _event=None):
+        self._set_recording(True)
+        self._display_text.set("请按下一个按键或组合键...")
+        self.config(bootstyle='info')
+
+    def _finish_recording(self):
+        self._set_recording(False)
+        self.refresh_display()
+
+    def stop_recording(self):
+        """Stop capture explicitly when the form or application changes state."""
+        self._finish_recording()
+
+    def _on_focus_in(self, event):
+        self._begin_recording(event)
+
+    def _on_focus_out(self, _event):
+        self._finish_recording()
+
+    def _on_click(self, _event):
+        if not self._is_recording:
+            self._begin_recording()
+
+    def _on_destroy(self, _event):
+        self._set_recording(False)
+
+    @staticmethod
+    def _action_modifiers(event):
+        return {
+            HotkeyUtils.normalize_action_key_name(key)
+            for key in HotkeyEntry._event_modifier_keys(event)
+        }
+
+    def _commit_key_chord(self, key_chord):
+        key_chord = HotkeyUtils.normalize_key_chord(key_chord)
+        if not HotkeyUtils.is_valid_key_chord(key_chord):
+            error = "无法识别该按键，未录入"
+        else:
+            error = self._validate_capture(key_chord)
+
+        if error:
+            self._finish_recording()
+            self.config(bootstyle='danger')
+            self._on_capture_error(str(error))
+            return 'break'
+
+        self.hotkey_var.set(key_chord)
+        self._finish_recording()
+        self.config(bootstyle='success')
         return 'break'
 
-# ======================================================================
+    def _on_key(self, event):
+        if not self._is_recording:
+            return 'break'
+
+        key = HotkeyUtils.normalize_action_key_name(
+            self._normalize_event_key(event)
+        )
+        if key in self._MODIFIER_KEYS:
+            modifiers = self._action_modifiers(event) | {key}
+            self._pressed_keys = modifiers
+            ordered = sorted(modifiers, key=lambda item: self._DISPLAY_ORDER[item])
+            self._display_text.set(
+                '+'.join(HotkeyUtils.format_hotkey_display(item) for item in ordered) + '+...'
+            )
+            return 'break'
+
+        pressed = self._action_modifiers(event) | (self._pressed_keys & self._MODIFIER_KEYS)
+        if key:
+            pressed.add(key)
+        ordered = sorted(
+            pressed,
+            key=lambda item: (self._DISPLAY_ORDER.get(item, 4), item),
+        )
+        return self._commit_key_chord('+'.join(ordered))
+
+    def _on_key_release(self, event):
+        if not self._is_recording:
+            return 'break'
+        key = HotkeyUtils.normalize_action_key_name(
+            self._normalize_event_key(event)
+        )
+        if key in self._MODIFIER_KEYS:
+            if self._pressed_keys == {key}:
+                return self._commit_key_chord(key)
+            self._pressed_keys.discard(key)
+            ordered = sorted(
+                self._pressed_keys,
+                key=lambda item: self._DISPLAY_ORDER[item],
+            )
+            if ordered:
+                self._display_text.set(
+                    '+'.join(
+                        HotkeyUtils.format_hotkey_display(item)
+                        for item in ordered
+                    ) + '+...'
+                )
+            else:
+                self._display_text.set("请按下一个按键或组合键...")
+        return 'break'
+
+    def get(self):
+        return self.hotkey_var.get()
+
+    def delete(self, *_args):
+        self.hotkey_var.set('')
+        self.refresh_display()
+
+    def insert(self, _index, chars, *_args):
+        self.hotkey_var.set(HotkeyUtils.normalize_key_chord(chars))
+        self.refresh_display()
 # 7. 快捷键设置对话框 (Hotkey)
 # ======================================================================
 class HotkeySettingsDialog:
@@ -944,29 +1261,7 @@ class HotkeySettingsDialog:
         self.dialog.destroy()
 
     def _validate_hotkey(self, hotkey):
-        parts = hotkey.split('+')
-        if not parts:
-            return False
-        if len(parts) == 1:
-            p = parts[0].strip().lower()
-            if len(p) == 1 and 'a' <= p <= 'z':
-                return True
-            if p.startswith('f') and p[1:].isdigit():
-                return int(p[1:]) in range(1, 13)
-            return False
-        modifiers = {'ctrl', 'alt', 'shift', 'cmd'}
-        valid_keys = {name for name in HotkeyUtils.PYNPUT_TO_VK.keys()
-                      if name not in ('ctrl_l', 'ctrl_r', 'alt_l', 'alt_r', 'alt_gr',
-                                      'shift_l', 'shift_r', 'cmd_l', 'cmd_r', 'cmd')}
-        for i, part in enumerate(parts):
-            part = part.strip()
-            if i < len(parts) - 1:
-                if part not in modifiers:
-                    return False
-            else:
-                if part not in valid_keys:
-                    return False
-        return True
+        return HotkeyUtils.is_valid_hotkey(hotkey)
 
     def _on_close(self):
         self.dialog.destroy()

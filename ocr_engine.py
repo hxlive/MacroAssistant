@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 # ocr_engine.py
-# 描述:自动化宏的 OCR 功能引擎
-# 版本:1.8.3
+# 功能说明：OCR 识别引擎，负责多后端探测、文字识别、文本匹配与结果缓存
+# 版本:1.8.5
 
 from PIL import Image
+import importlib
 import re
 import os
 import subprocess
@@ -337,9 +338,6 @@ def _capture_ocr_context(screenshot_pil, offset):
 
         screenshot, screen_offset = capture_physical_bbox()
         return _OcrContext(screenshot, screen_offset, True)
-    except OSError as e:
-        logger.warning("截图失败 (锁屏或无显示器): %s", e)
-        return None
     except Exception as e:
         logger.warning("截图失败 (锁屏或无显示器): %s", e)
         return None
@@ -640,6 +638,37 @@ def _build_char_index(words):
             char_boxes.append(_text_range_box(word, index, index + 1))
     return ''.join(text_parts), char_boxes
 
+def _boxes_share_text_line(first_box, second_box):
+    """Return whether two OCR boxes plausibly belong to the same text line."""
+    first_height = max(1, first_box[3] - first_box[1])
+    second_height = max(1, second_box[3] - second_box[1])
+    first_center = (first_box[1] + first_box[3]) / 2
+    second_center = (second_box[1] + second_box[3]) / 2
+    return abs(first_center - second_center) <= max(first_height, second_height) / 2
+
+def _words_are_spatially_adjacent(first_word, second_word):
+    first_box = first_word['box']
+    second_box = second_word['box']
+    if not _boxes_share_text_line(first_box, second_box):
+        return False
+    max_height = max(
+        1,
+        first_box[3] - first_box[1],
+        second_box[3] - second_box[1],
+    )
+    horizontal_gap = second_box[0] - first_box[2]
+    return -max_height <= horizontal_gap <= max_height * 3
+
+def _iter_spatial_word_groups(words):
+    group = []
+    for word in words:
+        if group and not _words_are_spatially_adjacent(group[-1], word):
+            yield group
+            group = []
+        group.append(word)
+    if group:
+        yield group
+
 class _Matcher:
     def match(self, words, target_norm, offset):
         valid_words = [word for word in words if word.get('text') and word.get('box')]
@@ -658,6 +687,8 @@ class _Matcher:
                 continue
             boxes = [word['box']]
             for j in range(i + 1, min(i + MAX_MERGE_WORDS, len(valid_words))):
+                if not _words_are_spatially_adjacent(valid_words[j - 1], valid_words[j]):
+                    break
                 merged += valid_words[j]['text']
                 boxes.append(valid_words[j]['box'])
                 if target_norm == merged:
@@ -677,17 +708,18 @@ class _Matcher:
                     'word': word,
                 }
 
-        if len(valid_words) < 2:
-            return None
-        indexed_text, char_boxes = _build_char_index(valid_words)
-        start = indexed_text.find(target_norm)
-        if start >= 0:
-            end = start + len(target_norm)
-            return {
-                'position': _center_word_boxes(char_boxes[start:end], offset),
-                'kind': 'chars',
-                'word': None,
-            }
+        for line_words in _iter_spatial_word_groups(valid_words):
+            if len(line_words) < 2:
+                continue
+            indexed_text, char_boxes = _build_char_index(line_words)
+            start = indexed_text.find(target_norm)
+            if start >= 0:
+                end = start + len(target_norm)
+                return {
+                    'position': _center_word_boxes(char_boxes[start:end], offset),
+                    'kind': 'chars',
+                    'word': None,
+                }
         return None
 
 _MATCHER = _Matcher()
@@ -708,9 +740,12 @@ def _recognize_winocr_words(winocr_module, lang_code, debug, screenshot_pil):
             for w in line.get('words', []):
                 if 'text' in w and 'bounding_rect' in w:
                     text_clean = _normalize_text(w['text'])
+                    box = _dict_box_to_tuple(w['bounding_rect'])
+                    if not text_clean or box is None:
+                        continue
                     word = {
                         'text': text_clean,
-                        'box': _dict_box_to_tuple(w['bounding_rect']),
+                        'box': box,
                         'original': w['text'],
                         'score': 0.0,
                     }
@@ -877,9 +912,12 @@ def _recognize_tesseract_words(lang, debug, screenshot_pil, enhanced_mode=False)
 
 def _is_winocr_available():
     try:
-        import winocr
+        importlib.import_module('winocr')
         return True
     except ImportError:
+        return False
+    except Exception as exc:
+        logger.warning("WinOCR backend is unavailable and was skipped: %s", exc)
         return False
 
 def _is_rapidocr_available_lightweight():

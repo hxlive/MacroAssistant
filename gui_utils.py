@@ -1,6 +1,7 @@
+# -*- coding: utf-8 -*-
 # gui_utils.py
-# 描述：GUI 组件工厂与界面逻辑处理 (重构版)
-# 版本：1.8.3
+# 功能说明：GUI 组件与参数表单工具，负责控件构建、输入校验和设置对话框
+# 版本：1.8.5
 
 import sys
 import tkinter as tk
@@ -15,7 +16,7 @@ import queue
 
 logger = logging.getLogger(__name__)
 
-from sys_utils import capture_physical_bbox, center_child_window
+from sys_utils import ActionKeyEntry, capture_physical_bbox, center_child_window
 
 # 引入核心库中的工具用于处理快捷键显示
 try:
@@ -68,7 +69,7 @@ _EMPTY_SKIP_ACTIONS = {'ELSE', 'END_IF', 'END_LOOP', 'END_FOREACH', 'NOTE', 'RUN
 _NUMERIC_PARAM_KEYS = {'x', 'y', 'ms', 'times', 'x_offset', 'y_offset', 'amount', 'max_iterations', 'max_jumps', 'max_lines', 'retry_count', 'timeout', 'clicks', 'interval', 'duration'}
 _NON_NEGATIVE_INT_PARAM_KEYS = {'ms', 'times', 'max_iterations', 'max_jumps', 'max_lines', 'retry_count', 'clicks'}
 _NON_NEGATIVE_FLOAT_PARAM_KEYS = {'interval', 'duration'}
-_POSITIVE_INT_PARAM_KEYS = {'max_iterations', 'max_jumps', 'max_lines'}
+_POSITIVE_INT_PARAM_KEYS = {'ms', 'times', 'clicks', 'max_iterations', 'max_jumps', 'max_lines'}
 _RUN_DEFAULT_OMIT_PARAMS = {
     'timeout': '30',
     'interpreter': 'python',
@@ -106,9 +107,6 @@ _SIMPLE_ACTION_FORM_FIELDS = {
     'TYPE_TEXT': (
         ('entry', 'text', '输入文本:', '你好', None),
     ),
-    'PRESS_KEY': (
-        ('entry', 'key', '按键或组合键 (Enter, Ctrl+C):', 'Enter', None),
-    ),
     'ACTIVATE_WINDOW': (
         ('entry', 'title', '窗口标题 (支持部分匹配):', '记事本', None),
     ),
@@ -131,7 +129,7 @@ _SIMPLE_ACTION_FORM_FIELDS = {
 }
 
 _SIMPLE_ACTION_HINTS = {
-    'CLICK': '* 提示: X/Y 留空则在当前鼠标位置点击；clicks/interval/duration 留空则使用默认值（1次/0毫秒/0秒）。',
+    'CLICK': '* 将鼠标移到目标位置后按 F8，可自动填写 X/Y；留空则在运行时当前位置点击。\n* clicks/interval/duration 留空则使用默认值（1次/0毫秒/0秒）。',
     'SCROLL': '* 提示: 如果 X, Y 为空，将在当前鼠标位置滚动。',
     'TYPE_TEXT': "* 此功能使用剪贴板 (Ctrl+V)，以支持中文及复杂文本输入。\n* 支持占位符: {CLIPBOARD} 将替换为剪贴板内容\n* 示例: '订单号: {CLIPBOARD}' → '订单号: 12345'",
     'ACTIVATE_WINDOW': '* 提示: 宏将查找标题中包含此文本的窗口，并将其激活到最前端。',
@@ -388,6 +386,10 @@ class MultiLineParamText(tk.Text):
 # ======================================================================
 # 参数控件工厂类（从 MacroMate.py 迁移）
 # ======================================================================
+def _should_show_text_extract_options(save_to_clipboard, save_to_var):
+    return bool(save_to_clipboard or str(save_to_var).strip())
+
+
 class ParamWidgetFactory:
     """
     参数控件工厂类，封装各类参数输入控件的创建逻辑
@@ -428,13 +430,47 @@ class ParamWidgetFactory:
             frame.bind('<Destroy>', _cleanup, add='+')
         return token
 
-    def create_param_entry(self, parent, key, label_text, default_value):
+    def create_param_entry(self, parent, key, label_text, default_value, textvariable=None):
         """Create a single-line parameter entry."""
         frame = ttk.Frame(parent)
         ttk.Label(frame, text=label_text, font=self.font_ui).pack(anchor="w")
-        entry = ttk.Entry(frame, width=25, font=self.font_ui)
-        entry.insert(0, default_value)
+        entry = ttk.Entry(
+            frame,
+            width=25,
+            font=self.font_ui,
+            textvariable=textvariable,
+        )
+        if textvariable is None:
+            entry.insert(0, default_value)
+        else:
+            textvariable.set(default_value)
         entry.pack(anchor="w", fill=tk.X)
+        entry._param_frame = frame
+        frame.pack(fill=tk.X, pady=8)
+        return entry
+
+
+    def create_action_key_entry(
+            self,
+            parent,
+            label_text,
+            default_value,
+            on_recording_change,
+            validate_capture,
+            on_capture_error):
+        """Create the PRESS_KEY recorder while preserving the normal param protocol."""
+        frame = ttk.Frame(parent)
+        ttk.Label(frame, text=label_text, font=self.font_ui).pack(anchor='w')
+        entry = ActionKeyEntry(
+            frame,
+            initial_value=default_value,
+            on_recording_change=on_recording_change,
+            validate_capture=validate_capture,
+            on_capture_error=on_capture_error,
+            width=25,
+            font=self.font_ui,
+        )
+        entry.pack(anchor='w', fill=tk.X)
         entry._param_frame = frame
         frame.pack(fill=tk.X, pady=8)
         return entry
@@ -672,7 +708,15 @@ class ParamWidgetFactory:
 
     def _add_text_capture_options(self, parent_frame, param_widgets):
         param_widgets['save_to_clipboard'] = self.create_param_checkbox(parent_frame, "save_to_clipboard", "[OK] 保存识别结果到剪贴板", default=False)
-        param_widgets['save_to_var'] = self.create_param_entry(parent_frame, "save_to_var", "保存至变量 (可选):", "")
+        save_to_var_value = tk.StringVar(master=parent_frame)
+        param_widgets['save_to_var'] = self.create_param_entry(
+            parent_frame,
+            "save_to_var",
+            "保存至变量 (可选):",
+            "",
+            textvariable=save_to_var_value,
+        )
+        save_to_var_value._param_frame = param_widgets['save_to_var']._param_frame
         sub_frame = ttk.Frame(parent_frame)
         sub_frame.pack(fill=tk.X)
         extract_frame = ttk.Frame(sub_frame)
@@ -683,12 +727,17 @@ class ParamWidgetFactory:
         param_widgets['extract_pattern'] = extract_entry
         hint = AutoWrapLabel(sub_frame, text="提取模式: 用正则表达式过滤识别结果，如 \\d+ 只提取数字；留空则保存全部文本。", font=self.font_ui, style="secondary.TLabel")
 
-        def toggle(var=param_widgets['save_to_clipboard'], ef=extract_frame, hint_label=hint):
-            if var.get():
+        def toggle(clipboard_var=param_widgets['save_to_clipboard'],
+                   variable_name=save_to_var_value,
+                   ef=extract_frame, hint_label=hint):
+            if _should_show_text_extract_options(
+                    clipboard_var.get(), variable_name.get()):
                 ef.pack(fill=tk.X, pady=8); hint_label.pack(anchor="w", pady=5, fill=tk.X)
             else:
                 ef.pack_forget(); hint_label.pack_forget()
         self._trace_add_for_widget(param_widgets['save_to_clipboard'], 'write', lambda *_: toggle())
+        self._trace_add_for_widget(save_to_var_value, 'write', lambda *_: toggle())
+        toggle()
 
 
     def _build_image_find_form(self, action_key, parent_frame, param_widgets, on_select_region,
@@ -747,6 +796,27 @@ class ParamWidgetFactory:
             title, lines = instruction
             self.create_instruction_panel(parent_frame, title, list(lines))
 
+    def _build_press_key_form(
+            self,
+            parent_frame,
+            param_widgets,
+            on_recording_change,
+            validate_capture,
+            on_capture_error):
+        param_widgets['key'] = self.create_action_key_entry(
+            parent_frame,
+            "按键或组合键:",
+            'enter',
+            on_recording_change,
+            validate_capture,
+            on_capture_error,
+        )
+        self.create_hint_label(
+            parent_frame,
+            "* 点击录制框，直接按下 Enter、Tab、Ctrl+C 等按键或组合键。",
+        )
+
+
 
     def _build_ai_command_form(self, parent_frame, param_widgets, on_select_region, on_test_ai_command, on_preview_region=None):
         param_widgets['instruction'] = self.create_param_text(parent_frame, "instruction", "AI 指令:", "点击列表里价格最低的那个商品", height=3)
@@ -766,7 +836,7 @@ class ParamWidgetFactory:
         param_widgets['save_output'] = self.create_param_checkbox(parent_frame, "save_output", "[OK] 保存输出到剪贴板", default=False)
         param_widgets['shell_mode'] = self.create_param_checkbox(parent_frame, "shell_mode", "[警告] shell 模式 (仅可信宏)", default=False)
         param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] RUN 失败时停止宏", default=False)
-        self.create_hint_label(parent_frame, "* {CLIPBOARD} = 剪贴板内容, {DATETIME} = 当前时间")
+        self.create_hint_label(parent_frame, "* 参数支持已定义变量插值，例如 {current_line}")
         param_widgets['run_type'].bind("<<ComboboxSelected>>", update_run_params_cb)
         update_run_params_cb(None)
 
@@ -779,6 +849,10 @@ class ParamWidgetFactory:
             ttk.Label(parent_frame, textvariable=mouse_pos_var, font=self.font_code, bootstyle="info").pack(anchor="w")
         if mouse_tracker is not None:
             mouse_tracker.start()
+        self.create_hint_label(
+            parent_frame,
+            "* 将鼠标移到目标位置后按 F8，可自动填写 X/Y 坐标。",
+        )
 
     def _build_loop_start_form(self, parent_frame, param_widgets, on_select_region, update_loop_params_cb, on_preview_region=None):
         param_widgets['mode'] = self.create_param_combobox(parent_frame, "mode", '循环模式:', list(LOOP_MODE_OPTIONS.keys()), default=LOOP_MODE_DISPLAY_BY_VALUE.get('fixed', '固定次数'))
@@ -792,6 +866,49 @@ class ParamWidgetFactory:
         self.create_hint_label(parent_frame, "* 提示:\n- 固定次数: 传统循环\n- 直到找到图像: 找到即停\n- 直到找到文本: 找到即停\n- 最大迭代: 安全机制")
         param_widgets['mode'].bind("<<ComboboxSelected>>", update_loop_params_cb)
         update_loop_params_cb(None)
+
+    def _build_read_file_form(self, parent_frame, param_widgets):
+        param_widgets['file_path'] = self.create_file_path_entry(parent_frame, "file_path", "文本文件路径:", "C:\\test.txt", filetypes=[("Text", "*.txt *.log *.csv *.json *.jsonl *.md *.xml *.yaml *.yml *.ini *.cfg"), ("All", "*.*")])
+        param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "保存至变量:", "file_content")
+        param_widgets['encoding'] = self.create_param_combobox(parent_frame, "encoding", "编码:", ["utf-8", "gbk", "gb2312"], default="utf-8")
+        param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] 读取失败时停止宏", default=False)
+
+    def _build_extract_var_form(self, parent_frame, param_widgets):
+        param_widgets['source_text'] = self.create_param_text(parent_frame, "source_text", "源文本:", "{ocr_result}", height=3)
+        param_widgets['regex'] = self.create_param_entry(parent_frame, "regex", "正则表达式:", r"\d+\.\d+")
+        param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "保存至变量:", "price")
+        param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] 提取失败时停止宏", default=False)
+        self.create_hint_label(parent_frame, "* 提示: 使用正则表达式提取，例如 \\d+ 提取纯数字。")
+
+    def _build_prompt_input_form(self, parent_frame, param_widgets):
+        param_widgets['title'] = self.create_param_entry(parent_frame, "title", "询问窗口标题:", "智点助手人工输入")
+        param_widgets['prompt'] = self.create_param_entry(parent_frame, "prompt", "询问内容:", "请输入验证码")
+        param_widgets['default_value'] = self.create_param_entry(parent_frame, "default_value", "默认值(可选):", "")
+        param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "保存至变量:", "user_input")
+        self.create_hint_label(parent_frame, "* 提示: 这是智点助手主动询问用户，不是识别其他软件或网页弹窗；取消输入会安全停止宏。")
+
+    def _build_foreach_line_form(self, parent_frame, param_widgets):
+        param_widgets['file_path'] = self.create_file_path_entry(parent_frame, "file_path", "文本数据文件:", "", filetypes=[("Text", "*.txt *.log *.csv *.tsv"), ("All", "*.*")])
+        param_widgets['source_text'] = self.create_param_text(parent_frame, "source_text", "数据内容:", "{file_content}", height=3)
+        param_widgets['current_line_var'] = self.create_compact_entry(parent_frame, "current_line_var", "当前行变量:", "current_line")
+        param_widgets['split_delimiter'] = self.create_compact_entry(parent_frame, "split_delimiter", "分隔符:", ",")
+        param_widgets['field_names'] = self.create_compact_entry(parent_frame, "field_names", "字段变量:", "account,password")
+        param_widgets['skip_empty'] = self.create_param_checkbox(parent_frame, "skip_empty", "[OK] 跳过空行", default=True)
+        self.create_hint_label(parent_frame, "* 每次取一行执行后续步骤；拆分后可直接使用 {account}、{password}。")
+
+        advanced_frame = self.create_collapsible_frame(parent_frame, "高级选项", expanded=False)
+        param_widgets['encoding'] = self.create_compact_combobox(advanced_frame, "encoding", "文本编码:", ["utf-8", "gbk", "gb2312"], default="utf-8")
+        param_widgets['index_var'] = self.create_compact_entry(advanced_frame, "index_var", "序号变量:", "loop_index")
+        param_widgets['total_var'] = self.create_compact_entry(advanced_frame, "total_var", "总数变量:", "loop_total")
+        param_widgets['max_lines'] = self.create_compact_entry(advanced_frame, "max_lines", "最大行数:", "10000")
+        param_widgets['strip_fields'] = self.create_param_checkbox(advanced_frame, "strip_fields", "[OK] 去掉字段前后空格", default=True)
+
+    def _build_write_file_form(self, parent_frame, param_widgets):
+        param_widgets['file_path'] = self.create_file_path_entry(parent_frame, "file_path", "文本文件路径:", "C:\\log.txt", mode="save", filetypes=[("Text", "*.txt *.log *.csv *.json *.jsonl *.md *.xml *.yaml *.yml *.ini *.cfg"), ("All", "*.*")])
+        param_widgets['content'] = self.create_param_text(parent_frame, "content", "写入文本:", "{date} - {result}", height=4)
+        param_widgets['encoding'] = self.create_param_combobox(parent_frame, "encoding", "编码:", ["utf-8", "gbk", "gb2312"], default="utf-8")
+        param_widgets['append'] = self.create_param_checkbox(parent_frame, "append", "[OK] 追加模式 (不覆盖原文本文件)", default=True)
+        param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] 写入失败时停止宏", default=False)
 
     def build_action_form(self, action_key, parent_frame, param_widgets, available_ocr_keys, callbacks):
         """
@@ -812,6 +929,9 @@ class ParamWidgetFactory:
         on_test_find_text = callbacks.get('on_test_find_text_click')
         on_test_ai_command = callbacks.get('on_test_ai_command_click')
         update_loop_params_cb = callbacks.get('update_loop_params') or self._noop
+        on_key_recording_change = callbacks.get('on_key_recording_change') or self._noop
+        validate_recorded_key = callbacks.get('validate_recorded_key') or self._noop
+        on_key_recording_error = callbacks.get('on_key_recording_error') or self._noop
         update_run_params_cb = callbacks.get('update_run_params') or self._noop
         mouse_tracker = callbacks.get('mouse_tracker')
         mouse_pos_var = callbacks.get('mouse_pos_var')
@@ -831,7 +951,17 @@ class ParamWidgetFactory:
             self._build_image_find_form(action_key, parent_frame, param_widgets, on_select_region, browse_image_cb, on_test_find_image, on_preview_region)
 
         elif action_key == 'FIND_TEXT':
+
             self._build_text_find_form(action_key, parent_frame, param_widgets, available_ocr_keys, on_select_region, on_test_find_text, on_preview_region)
+
+        elif action_key == 'PRESS_KEY':
+            self._build_press_key_form(
+                parent_frame,
+                param_widgets,
+                on_key_recording_change,
+                validate_recorded_key,
+                on_key_recording_error,
+            )
 
         elif action_key in _SIMPLE_ACTION_FORM_FIELDS:
             self._build_simple_action_form(action_key, parent_frame, param_widgets)
@@ -864,127 +994,98 @@ class ParamWidgetFactory:
             self.create_hint_label(parent_frame, "* 提示: 'END_FOREACH' 标志着批量处理块结束。")
             
         elif action_key == 'READ_FILE':
-            param_widgets['file_path'] = self.create_file_path_entry(parent_frame, "file_path", "文本文件路径:", "C:\\test.txt", filetypes=[("Text", "*.txt *.log *.csv *.json *.jsonl *.md *.xml *.yaml *.yml *.ini *.cfg"), ("All", "*.*")])
-            param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "保存至变量:", "file_content")
-            param_widgets['encoding'] = self.create_param_combobox(parent_frame, "encoding", "编码:", ["utf-8", "gbk", "gb2312"], default="utf-8")
-            param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] 读取失败时停止宏", default=False)
-            
+            self._build_read_file_form(parent_frame, param_widgets)
+
         elif action_key == 'EXTRACT_VAR':
-            param_widgets['source_text'] = self.create_param_text(parent_frame, "source_text", "源文本:", "{ocr_result}", height=3)
-            param_widgets['regex'] = self.create_param_entry(parent_frame, "regex", "正则表达式:", r"\d+\.\d+")
-            param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "保存至变量:", "price")
-            param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] 提取失败时停止宏", default=False)
-            self.create_hint_label(parent_frame, "* 提示: 使用正则表达式提取，例如 \\d+ 提取纯数字。")
+            self._build_extract_var_form(parent_frame, param_widgets)
 
         elif action_key == 'PROMPT_INPUT':
-            param_widgets['title'] = self.create_param_entry(parent_frame, "title", "询问窗口标题:", "智点助手人工输入")
-            param_widgets['prompt'] = self.create_param_entry(parent_frame, "prompt", "询问内容:", "请输入验证码")
-            param_widgets['default_value'] = self.create_param_entry(parent_frame, "default_value", "默认值(可选):", "")
-            param_widgets['var_name'] = self.create_param_entry(parent_frame, "var_name", "保存至变量:", "user_input")
-            self.create_hint_label(parent_frame, "* 提示: 这是智点助手主动询问用户，不是识别其他软件或网页弹窗；取消输入会安全停止宏。")
+            self._build_prompt_input_form(parent_frame, param_widgets)
 
         elif action_key == 'FOREACH_LINE':
-            param_widgets['file_path'] = self.create_file_path_entry(parent_frame, "file_path", "文本数据文件:", "", filetypes=[("Text", "*.txt *.log *.csv *.tsv"), ("All", "*.*")])
-            param_widgets['source_text'] = self.create_param_text(parent_frame, "source_text", "数据内容:", "{file_content}", height=3)
-            param_widgets['current_line_var'] = self.create_compact_entry(parent_frame, "current_line_var", "当前行变量:", "current_line")
-            param_widgets['split_delimiter'] = self.create_compact_entry(parent_frame, "split_delimiter", "分隔符:", ",")
-            param_widgets['field_names'] = self.create_compact_entry(parent_frame, "field_names", "字段变量:", "account,password")
-            param_widgets['skip_empty'] = self.create_param_checkbox(parent_frame, "skip_empty", "[OK] 跳过空行", default=True)
-            self.create_hint_label(parent_frame, "* 每次取一行执行后续步骤；拆分后可直接使用 {account}、{password}。")
+            self._build_foreach_line_form(parent_frame, param_widgets)
 
-            advanced_frame = self.create_collapsible_frame(parent_frame, "高级选项", expanded=False)
-            param_widgets['encoding'] = self.create_compact_combobox(advanced_frame, "encoding", "文本编码:", ["utf-8", "gbk", "gb2312"], default="utf-8")
-            param_widgets['index_var'] = self.create_compact_entry(advanced_frame, "index_var", "序号变量:", "loop_index")
-            param_widgets['total_var'] = self.create_compact_entry(advanced_frame, "total_var", "总数变量:", "loop_total")
-            param_widgets['max_lines'] = self.create_compact_entry(advanced_frame, "max_lines", "最大行数:", "10000")
-            param_widgets['strip_fields'] = self.create_param_checkbox(advanced_frame, "strip_fields", "[OK] 去掉字段前后空格", default=True)
-             
         elif action_key == 'IF_VAR':
             self._build_var_compare_form(parent_frame, param_widgets, "{price}", "100")
 
         elif action_key == 'WRITE_FILE':
-            param_widgets['file_path'] = self.create_file_path_entry(parent_frame, "file_path", "文本文件路径:", "C:\\log.txt", mode="save", filetypes=[("Text", "*.txt *.log *.csv *.json *.jsonl *.md *.xml *.yaml *.yml *.ini *.cfg"), ("All", "*.*")])
-            param_widgets['content'] = self.create_param_text(parent_frame, "content", "写入文本:", "{date} - {result}", height=4)
-            param_widgets['encoding'] = self.create_param_combobox(parent_frame, "encoding", "编码:", ["utf-8", "gbk", "gb2312"], default="utf-8")
-            param_widgets['append'] = self.create_param_checkbox(parent_frame, "append", "[OK] 追加模式 (不覆盖原文本文件)", default=True)
-            param_widgets['fail_stop'] = self.create_param_checkbox(parent_frame, "fail_stop", "[警告] 写入失败时停止宏", default=False)
-            
+            self._build_write_file_form(parent_frame, param_widgets)
+
         elif action_key == 'GOTO_IF':
             self._build_var_compare_form(parent_frame, param_widgets, "{status}", '缺货', include_goto_fields=True)
 
         return None
 
-    def collect_step_data(self, action_key, param_widgets, engine_key_map=None):
-        """
-        从参数控件中收集并校验数据
-
-        Returns:
-            params: 整理后的参数字典
-            error: 错误消息，若无错误则为 None
-        """
+    def _collect_widget_params(self, action_key, param_widgets, engine_key_map):
         params = {}
-        try:
-            for k, w in param_widgets.items():
-                if isinstance(w, tk.BooleanVar):
-                    params[k] = w.get()
-                    continue
+        for k, w in param_widgets.items():
+            if isinstance(w, tk.BooleanVar):
+                params[k] = w.get()
+                continue
 
-                val = w.get()
-
-                error = _validate_numeric_param(k, val)
-                if error:
-                    return None, error
-
-                if k == 'confidence':
-                    error = _validate_confidence(val)
-                    if error:
-                        return None, error
-
-                if k == 'retry_interval':
-                    error = _validate_retry_interval(val)
-                    if error:
-                        return None, error
-
-                if not val:
-                    if action_key in _EMPTY_SKIP_ACTIONS:
-                        continue
-                    if not _is_optional_empty_param(action_key, k):
-                        return None, f"参数 '{k}' 不能为空"
-
-                converted_value, error, include_param = _convert_param_value(k, val, engine_key_map)
-                if error:
-                    return None, error
-                if include_param:
-                    params[k] = converted_value
-
-            if action_key == 'RUN':
-                params, error = _sanitize_run_params(params)
-                if error:
-                    return None, error
-
-            if action_key == 'GOTO_LABEL':
-                params, error = _sanitize_goto_label_params(params)
-                if error:
-                    return None, error
-
-            if action_key == 'LOOP_START':
-                params, error = _sanitize_loop_start_params(params)
-                if error:
-                    return None, error
-
-            if action_key == 'FOREACH_LINE':
-                params, error = _sanitize_foreach_line_params(params)
-                if error:
-                    return None, error
-
-            error = _validate_image_params(params)
+            val = w.get()
+            error = _validate_numeric_param(k, val)
             if error:
                 return None, error
 
-            return params, None
+            if k == 'confidence':
+                error = _validate_confidence(val)
+                if error:
+                    return None, error
+
+            if k == 'retry_interval':
+                error = _validate_retry_interval(val)
+                if error:
+                    return None, error
+
+            if not val:
+                if action_key in _EMPTY_SKIP_ACTIONS:
+                    continue
+                if not _is_optional_empty_param(action_key, k):
+                    return None, f"参数 '{k}' 不能为空"
+
+            converted_value, error, include_param = _convert_param_value(
+                k,
+                val,
+                engine_key_map,
+            )
+            if error:
+                return None, error
+            if include_param:
+                params[k] = converted_value
+        return params, None
+
+    @staticmethod
+    def _sanitize_collected_params(action_key, params):
+        sanitizer = {
+            'RUN': _sanitize_run_params,
+            'GOTO_LABEL': _sanitize_goto_label_params,
+            'LOOP_START': _sanitize_loop_start_params,
+            'FOREACH_LINE': _sanitize_foreach_line_params,
+        }.get(action_key)
+        if sanitizer is not None:
+            params, error = sanitizer(params)
+            if error:
+                return None, error
+
+        error = _validate_image_params(params)
+        if error:
+            return None, error
+        return params, None
+
+    def collect_step_data(self, action_key, param_widgets, engine_key_map=None):
+        """Collect, convert, and validate one action form."""
+        try:
+            params, error = self._collect_widget_params(
+                action_key,
+                param_widgets,
+                engine_key_map,
+            )
+            if error:
+                return None, error
+            return self._sanitize_collected_params(action_key, params)
         except Exception as e:
             return None, str(e)
-
 
 # ======================================================================
 # 参数动态显示控制函数（从 MacroMate.py 迁移）
@@ -1092,6 +1193,7 @@ class VLMSettingsDialog:
     def __init__(self, parent):
         self.result = None
         self._ui_callbacks = queue.Queue()
+        self._test_in_progress = False
         try:
             import vlm_engine
             self.current_config = vlm_engine.load_config()
@@ -1167,12 +1269,21 @@ class VLMSettingsDialog:
         btn_frame.columnconfigure(0, weight=1)
         btn_frame.columnconfigure(1, weight=1)
         btn_frame.columnconfigure(2, weight=1)
-        ttk.Button(btn_frame, text="取消", command=self.dialog.destroy,
-                   bootstyle="secondary", padding=(10, 8)).grid(row=0, column=0, sticky="ew", padx=(0, 3))
-        ttk.Button(btn_frame, text="测试连接", command=self._test_connection,
-                   bootstyle="info", padding=(10, 8)).grid(row=0, column=1, sticky="ew", padx=3)
-        ttk.Button(btn_frame, text="保存", command=self._save,
-                   bootstyle="primary", padding=(10, 8)).grid(row=0, column=2, sticky="ew", padx=(3, 0))
+        self.cancel_button = ttk.Button(
+            btn_frame, text="取消", command=self.dialog.destroy,
+            bootstyle="secondary", padding=(10, 8),
+        )
+        self.cancel_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.test_button = ttk.Button(
+            btn_frame, text="测试连接", command=self._test_connection,
+            bootstyle="info", padding=(10, 8),
+        )
+        self.test_button.grid(row=0, column=1, sticky="ew", padx=3)
+        self.save_button = ttk.Button(
+            btn_frame, text="保存", command=self._save,
+            bootstyle="primary", padding=(10, 8),
+        )
+        self.save_button.grid(row=0, column=2, sticky="ew", padx=(3, 0))
 
         ttk.Label(main_frame, text="输入 API Key，选择提供商，保存即可使用 AI 指令动作",
                   font=("Microsoft YaHei UI", 8), foreground="#666").pack(pady=(10, 0))
@@ -1205,8 +1316,16 @@ class VLMSettingsDialog:
             if not self.model_var.get():
                 self.model_var.set(default_model)
 
+    def _set_test_controls_state(self, state):
+        for button_name in ('cancel_button', 'test_button', 'save_button'):
+            button = getattr(self, button_name, None)
+            if button is not None:
+                button.config(state=state)
+
     def _test_connection(self):
-        # [修复H-6] 改为后台线程执行，避免阻塞 UI 事件循环
+        # 后台执行连接测试；同一对话框只允许一个测试请求。
+        if self._test_in_progress:
+            return
         try:
             import vlm_engine, io, threading
             api_key = self.api_key_var.get().strip()
@@ -1215,15 +1334,10 @@ class VLMSettingsDialog:
                 return
             config = self._build_current_vlm_config(system_prompt="你是一个助手，直接回答用户问题即可。")
 
-            # 禁用按钮并显示等待状态（UI 层立即响应）
+            # 禁用实际操作按钮并显示等待状态（UI 层立即响应）。
+            self._test_in_progress = True
             self.dialog.config(cursor="watch")
-            original_states = {}
-            for child in self.dialog.winfo_children():
-                try:
-                    original_states[child] = child.cget("state")
-                    child.config(state="disabled")
-                except Exception:
-                    pass
+            self._set_test_controls_state("disabled")
             self.dialog.update()
 
             def _do_test():
@@ -1244,11 +1358,10 @@ class VLMSettingsDialog:
                         except Exception: pass
                     # 恢复 UI 状态
                     def _restore():
+                        self._test_in_progress = False
                         try:
                             self.dialog.config(cursor="")
-                            for child in self.dialog.winfo_children():
-                                try: child.config(state=original_states.get(child, "normal"))
-                                except Exception: pass
+                            self._set_test_controls_state("normal")
                         except Exception:
                             pass
                     self._safe_dialog_after(_restore)
@@ -1256,8 +1369,10 @@ class VLMSettingsDialog:
             threading.Thread(target=_do_test, daemon=True).start()
 
         except Exception as e:
+            self._test_in_progress = False
             messagebox.showerror("错误", f"启动测试失败: {e}", parent=self.dialog)
             self.dialog.config(cursor="")
+            self._set_test_controls_state("normal")
 
     def _safe_dialog_after(self, callback):
         """Queue a UI callback without touching Tk from a worker thread."""

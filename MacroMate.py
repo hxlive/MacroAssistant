@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 # MacroMate.py
-# 描述: 自动化宏的 GUI 界面
-# Version: 1.8.3
+# 功能说明：应用入口与 GUI 外壳，负责界面生命周期、宏运行控制和配置持久化
+# Version: 1.8.5
+APP_VERSION = "1.8.5"
 
-
-# 使用: 
+# 使用:
 #   - GUI 模式: python MacroMate.py
 #   - 命令行: python MacroMate.py script.json
 #             python MacroMate.py --run script.json
@@ -28,8 +28,6 @@ def _get_program_dir():
 
 
 APP_DIR = _get_program_dir()
-
-
 
 
 def _has_owned_log_handler(root_logger, handler_kind):
@@ -131,7 +129,6 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 import json
 import pyautogui
 import threading
-import copy
 import ttkbootstrap as tb
 import queue
 import ctypes
@@ -142,15 +139,21 @@ ctypes.pythonapi.PyThreadState_SetAsyncExc.restype = ctypes.c_int
 # =================================================================
 # 全局配置
 # =================================================================
-APP_VERSION = "1.8.3"
+
 APP_TITLE = f"智点助手 (MacroMate) v{APP_VERSION}"
-APP_ICON = "app_icon.ico" 
+APP_ICON = "app_icon.ico"
 
 CONFIG_FILE = os.path.join(APP_DIR, "macro_settings.json")
 MAX_RECENT_FILES = 5
 
 DEFAULT_HOTKEY_RUN = "ctrl+f1"
 DEFAULT_HOTKEY_STOP = "ctrl+f2"
+LIGHT_THEMES = ('litera', 'cosmo', 'flatly', 'journal', 'lumen', 'minty', 'pulse', 'sandstone', 'united', 'yeti')
+DARK_THEMES = ('superhero', 'cyborg', 'darkly', 'solar')
+KNOWN_THEMES = frozenset((
+    *LIGHT_THEMES, *DARK_THEMES,
+    'cerculean', 'morph', 'simplex', 'vapor',
+))
 # =================================================================
 # 性能优化常量
 STATUS_QUEUE_CHECK_INTERVAL_IDLE = 500  # 空闲时状态队列检查间隔（毫秒）
@@ -167,252 +170,75 @@ logger = logging.getLogger(__name__)
 # 导入核心模块与工具类
 try:
     import core_engine as macro_engine
+    from step_controller import StepController, StepControllerServices
     import ocr_engine
-    import vlm_engine
-    import gui_utils
-    
+
     from sys_utils import (
-        GlobalHotkeyManager, HotkeyUtils, MouseTracker, RegionSelector, RegionPreviewOverlay, 
-        HotkeySettingsDialog, ImageTooltipManager, MiniStatusWindow,
+        GlobalHotkeyManager, HotkeyUtils, MouseTracker,
+        HotkeySettingsDialog, MiniStatusWindow,
         AboutDialog
     )
     from gui_utils import (
-        ParamWidgetFactory, VLMSettingsDialog, parse_region_string, get_icon_path,
-        update_loop_params, update_run_params, param_internal_to_display
+        ParamWidgetFactory, VLMSettingsDialog, get_icon_path
     )
-    from core_engine import MacroSchema, validate_macro_data, MacroPersistence
+    from core_engine import validate_macro_data
 except ImportError as e:
     messagebox.showerror("导入错误", f"缺少必要的模块文件或导入失败: {e}\n请确保所有 py 文件都在同一目录。")
     exit()
 
-def capitalize_hotkey_str(s): return HotkeyUtils.format_hotkey_display(s)
-
-
-def _region_box_to_screenshot_region(region_box):
-    """Convert an optional bbox into the screenshot region used by test actions."""
-    if region_box is None:
-        return None
-
-    region = macro_engine.bbox_to_region(region_box)
-    if region is None:
-        raise ValueError(f"手动查找区域解析失败(格式错误): {region_box}")
-    return region
-
-
-def _parse_optional_test_region(region_value):
-    raw_region = (region_value or "").strip()
-    if not raw_region:
-        return None
-
-    region_box = parse_region_string(raw_region)
-    if region_box is None:
-        raise ValueError("手动查找区域格式无效，应为 x1, y1, x2, y2")
-
-    _region_box_to_screenshot_region(region_box)
-    return region_box
-
-
-
-
-def _preview_goto_label(p):
-    label = p.get('label', '')
-    max_jumps = p.get('max_jumps', 100)
-    return f"-> {label}  [最多 {max_jumps} 次]"
-
-
-def _preview_foreach_line(p):
-    source = p.get('file_path') or p.get('source_text', '')
-    line_var = p.get('current_line_var', 'current_line')
-    fields = p.get('field_names', '')
-    suffix = f"；拆分为 {fields}" if fields else ""
-    return f"批量处理文本行 '{source}' -> {{{line_var}}}{suffix}"
-
-
-_STEP_PARAM_PREVIEW_FORMATTERS = {
-    'GOTO_LABEL': _preview_goto_label,
-    'SET_VAR': lambda p: f"变量 {p.get('var_name', '')} = '{p.get('var_value', '')}'",
-    'READ_FILE': lambda p: f"读取文本 '{p.get('file_path', '')}' -> 变量 {p.get('var_name', '')}",
-    'EXTRACT_VAR': lambda p: f"'{p.get('source_text', '')}' 提取 '{p.get('regex', '')}' -> 变量 {p.get('var_name', '')}",
-    'PROMPT_INPUT': lambda p: f"人工输入 '{p.get('prompt', '')}' -> 变量 {p.get('var_name', '')}",
-    'FOREACH_LINE': _preview_foreach_line,
-    'END_FOREACH': lambda _p: '结束批量处理',
-    'IF_VAR': lambda p: f"如果 '{p.get('var_value', '')}' {p.get('operator', '==')} '{p.get('expected_val', '')}'",
-    'CALCULATE': lambda p: f"变量计算 '{p.get('expression', '')}' -> 变量 {p.get('var_name', '')}",
-    'WRITE_FILE': lambda p: f"写入文本至 '{p.get('file_path', '')}'",
-    'GOTO_IF': lambda p: f"如果 '{p.get('var_value', '')}' {p.get('operator', '==')} '{p.get('expected_val', '')}' -> 跳转至 {p.get('label', '')}",
-}
-_LIST_DEDENT_ACTIONS = {'ELSE', 'END_IF', 'END_LOOP', 'END_FOREACH'}
-_LIST_BLOCK_START_ACTIONS = {'LOOP_START', 'FOREACH_LINE'}
-_LIST_BLOCK_END_ACTIONS = {'END_IF', 'END_LOOP', 'END_FOREACH'}
-
-
-def _is_list_block_start(action):
-    return action.startswith('IF_') or action in _LIST_BLOCK_START_ACTIONS
-
-
-class _ParamScrollbarController:
-    """自绘浮动滚动条控制器，封装所有滚动条交互细节。
-
-    将原本散落在 MacroApp 中的 18 个方法和 7 个状态变量内聚到一处，
-    对外只暴露 frame / canvas / window_id 和 refresh()。
-    """
-
-    def __init__(self, parent, root):
-        self.root = root
-        self.canvas = tk.Canvas(parent, highlightthickness=0, borderwidth=0)
-        self.scrollbar = tk.Canvas(self.canvas, width=8, highlightthickness=0, borderwidth=0)
-        self.frame = ttk.Frame(self.canvas)
-        self.window_id = self.canvas.create_window((0, 0), window=self.frame, anchor="nw")
-
-        # 内部状态
-        self._visible = False
-        self._update_pending = False
-        self._drag_offset = 0
-        self._thumb = (0, 0)
-        self._thumb_color = "#9aa0a6"
-        self._thumb_active_color = "#6f767d"
-
-        # 样式与绑定
-        self._apply_theme()
-        self.canvas.configure(yscrollcommand=self.on_yview_changed)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.frame.bind("<Configure>", lambda e: self.on_frame_configure())
-        self.canvas.bind("<Configure>", self.on_canvas_configure)
-        self.scrollbar.bind("<ButtonPress-1>", self._on_scrollbar_press)
-        self.scrollbar.bind("<B1-Motion>", self._on_scrollbar_drag)
-        self._bind_mousewheel(self.canvas)
-        self._bind_mousewheel(self.frame)
-        self.update_visibility()
-
-    def _apply_theme(self):
+class MacroPersistence:
+    @staticmethod
+    def convert_to_native(obj):
+        """递归转换所有值为 Python 原生类型 (处理 numpy 等类型)"""
         try:
-            bg = self.canvas.cget("background")
-        except Exception:
-            bg = "#f5f5f5"
-        self.scrollbar.configure(background=bg)
+            import numpy as np
+            numpy_types = (np.integer, np.floating)
+        except ImportError:
+            numpy_types = ()
 
-    # --- 事件处理 ---
-
-    def on_frame_configure(self):
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        self._schedule_update()
-
-    def on_canvas_configure(self, event):
-        self.canvas.itemconfigure(self.window_id, width=event.width)
-        self._schedule_update()
-
-    def on_yview_changed(self, *args):
-        # yscrollcommand 回调会传 first, last，这里不需要使用
-        self._schedule_update()
-
-    def refresh(self):
-        """外部入口：刷新滚动区域、重新绑定子 widget 鼠标滚轮、重置到顶部。"""
-        self.root.update_idletasks()
-        self._bind_mousewheel_recursive(self.frame)
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        self.canvas.yview_moveto(0)
-        self.update_visibility()
-
-    # --- 内部更新调度 ---
-
-    def _schedule_update(self):
-        if self._update_pending:
-            return
-        self._update_pending = True
-        self.root.after_idle(self.update_visibility)
-
-    def update_visibility(self):
-        self._update_pending = False
-        bbox = self.canvas.bbox("all")
-        content_height = (bbox[3] - bbox[1]) if bbox else 0
-        canvas_height = max(self.canvas.winfo_height(), 1)
-        should_show = content_height > canvas_height + 1
-        self._set_visible(should_show)
-        if not should_show:
-            self.canvas.yview_moveto(0)
-        self._draw_thumb()
-
-    def _set_visible(self, visible):
-        if self._visible == visible:
-            return
-        self._visible = visible
-        if visible:
-            self.scrollbar.place(in_=self.canvas, relx=1.0, rely=0.0, relheight=1.0, anchor="ne", width=8)
+        if isinstance(obj, dict):
+            return {k: MacroPersistence.convert_to_native(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [MacroPersistence.convert_to_native(item) for item in obj]
+        elif numpy_types and isinstance(obj, numpy_types):
+            return obj.item()
         else:
-            self.scrollbar.place_forget()
+            return obj
 
-    def _draw_thumb(self, active=False):
-        if not self._visible:
-            self.scrollbar.delete("all")
-            return
-        self.scrollbar.update_idletasks()
-        height = max(self.scrollbar.winfo_height(), self.canvas.winfo_height(), 1)
-        first, last = self.canvas.yview()
-        visible_fraction = max(last - first, 0.05)
-        thumb_height = max(int(height * visible_fraction), 24)
-        thumb_height = min(thumb_height, height)
-        track_height = max(height - thumb_height, 1)
-        y1 = int(track_height * first / max(1.0 - visible_fraction, 0.0001)) if visible_fraction < 1 else 0
-        y1 = max(0, min(y1, height - thumb_height))
-        y2 = y1 + thumb_height
-        self._thumb = (y1, y2)
-        color = self._thumb_active_color if active else self._thumb_color
-        self.scrollbar.delete("all")
-        self.scrollbar.create_rectangle(2, y1, 6, y2, fill=color, outline="")
+    @staticmethod
+    def save(file_path, steps):
+        file_path = os.fspath(file_path)
+        native_steps = MacroPersistence.convert_to_native(steps)
+        tmp_path = file_path + '.tmp'
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write('[\n')
+                for i, step in enumerate(native_steps):
+                    step_str = json.dumps(step, ensure_ascii=False)
+                    if i < len(native_steps) - 1:
+                        f.write(f'    {step_str},\n')
+                    else:
+                        f.write(f'    {step_str}\n')
+                f.write(']\n')
+            os.replace(tmp_path, file_path)
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.debug('Failed to clean macro temp file', exc_info=True)
+            raise
 
-    # --- 拖拽 ---
+    @staticmethod
+    def load(file_path):
+        """从 JSON 文件加载宏"""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data
 
-    def _on_scrollbar_press(self, event):
-        if not self._visible:
-            return "break"
-        y1, y2 = self._thumb
-        if y1 <= event.y <= y2:
-            self._drag_offset = event.y - y1
-        else:
-            self._drag_offset = max((y2 - y1) // 2, 0)
-            self._move_thumb_to(event.y)
-        self._draw_thumb(active=True)
-        return "break"
 
-    def _on_scrollbar_drag(self, event):
-        if not self._visible:
-            return "break"
-        self._move_thumb_to(event.y)
-        self._draw_thumb(active=True)
-        return "break"
-
-    def _move_thumb_to(self, y):
-        height = max(self.scrollbar.winfo_height(), 1)
-        y1, y2 = self._thumb
-        thumb_height = max(y2 - y1, 1)
-        track_height = max(height - thumb_height, 1)
-        target = max(0, min(y - self._drag_offset, track_height))
-        self.canvas.yview_moveto(target / track_height)
-
-    # --- 鼠标滚轮 ---
-
-    def _bind_mousewheel(self, widget):
-        if getattr(widget, '_macromate_param_scroll_bound', False):
-            return
-        widget.bind("<MouseWheel>", self._on_mousewheel, add="+")
-        widget.bind("<Button-4>", self._on_mousewheel, add="+")
-        widget.bind("<Button-5>", self._on_mousewheel, add="+")
-        widget._macromate_param_scroll_bound = True
-
-    def _bind_mousewheel_recursive(self, widget):
-        self._bind_mousewheel(widget)
-        for child in widget.winfo_children():
-            self._bind_mousewheel_recursive(child)
-
-    def _on_mousewheel(self, event):
-        if getattr(event, 'num', None) == 4:
-            direction = -1
-        elif getattr(event, 'num', None) == 5:
-            direction = 1
-        else:
-            direction = -1 if event.delta > 0 else 1
-        self.canvas.yview_scroll(direction, "units")
-        return "break"
+def capitalize_hotkey_str(s): return HotkeyUtils.format_hotkey_display(s)
 
 
 class MacroApp:
@@ -430,6 +256,7 @@ class MacroApp:
         self._setup_mouse_tracker()
         self._setup_ocr_state()
         self._setup_widget_factory()
+        self._setup_step_controller()
         self._show_loading_then_defer_ui()
 
     def _setup_window(self):
@@ -460,11 +287,6 @@ class MacroApp:
             logger.warning("未找到图标文件，使用默认图标")
 
     def _setup_app_state(self):
-        # === Step Editing ===
-        self.steps = []
-        self.editing_index = None
-        self.last_test_location = None
-
         # === Macro Run State Machine ===
         self.is_macro_running = False
         self.current_run_context = None
@@ -528,6 +350,36 @@ class MacroApp:
         )
 
 
+    def _setup_step_controller(self):
+        services = StepControllerServices(
+            post_to_ui=self._queue_ui_callback,
+            is_window_alive=lambda: self.is_app_running,
+            set_status=lambda text: self.root.after(
+                0, lambda value=text: (
+                    self.status_var.set(value)
+                    if value else self.update_status_bar_hotkeys()
+                )
+            ),
+            get_enhanced_mode=lambda: bool(self.enhanced_mode_var.get()),
+            set_key_recording_active=self.hotkey_manager.set_key_recording_active,
+            set_coordinate_capture=self.hotkey_manager.set_coordinate_capture,
+            get_reserved_hotkeys=lambda: {
+                "运行宏": self.hotkey_run_str.get(),
+                "停止宏": self.hotkey_stop_str.get(),
+            },
+        )
+        self.step_controller = StepController(
+            root=self.root,
+            widget_factory=self.widget_factory,
+            mouse_tracker=self.mouse_tracker,
+            ocr_engine_mapping=self.FULL_OCR_NAME_MAP,
+            services=services,
+        )
+        self.step_controller.set_available_ocr_keys(self.available_ocr_keys)
+
+
+
+
     # ================================================================
     # Deferred Startup And Runtime Services
     # ================================================================
@@ -570,7 +422,7 @@ class MacroApp:
         return True
 
     def _start_runtime_services(self):
-        self.tooltip_manager = ImageTooltipManager(self.steps_tree, lambda: self.steps)
+        self.step_controller.start_ui_services()
         self.load_app_settings()
         self.update_recent_files_menu()
         self.update_status_bar_hotkeys()
@@ -597,6 +449,7 @@ class MacroApp:
             return
         self.available_ocr_engines = engines
         self.available_ocr_keys = [e[0] for e in engines]
+        self.step_controller.set_available_ocr_keys(self.available_ocr_keys)
         if 'none' in self.available_ocr_keys:
             logger.warning("未找到任何可用的OCR引擎 (RapidOCR, Tesseract, WinOCR)。")
             try:
@@ -646,13 +499,11 @@ class MacroApp:
     def _build_theme_menu(self):
         theme_menu = tk.Menu(self.menu_bar, tearoff=0, font=self.font_ui)
         self.menu_bar.add_cascade(label="  主题  ", menu=theme_menu)
-        
-        light_themes = ['litera', 'cosmo', 'flatly', 'journal', 'lumen', 'minty', 'pulse', 'sandstone', 'united', 'yeti']
-        for theme in light_themes:
+
+        for theme in LIGHT_THEMES:
             theme_menu.add_radiobutton(label=f"亮 - {theme.capitalize()}", variable=self.current_theme, value=theme, command=self.change_theme)
         theme_menu.add_separator()
-        dark_themes = ['superhero', 'cyborg', 'darkly', 'solar']
-        for theme in dark_themes:
+        for theme in DARK_THEMES:
             theme_menu.add_radiobutton(label=f"暗 - {theme.capitalize()}", variable=self.current_theme, value=theme, command=self.change_theme)
 
     def _build_about_menu(self):
@@ -670,8 +521,8 @@ class MacroApp:
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True)
         self._build_step_list_panel(main_frame)
-        self._build_step_editor_panel(main_frame)
-        self.update_param_fields(None)
+        self.step_controller.build_step_form(main_frame)
+        self.step_controller.update_param_fields(None)
 
     def _build_status_bar(self):
         status_bar_frame = ttk.Frame(self.root, bootstyle="primary")
@@ -690,38 +541,7 @@ class MacroApp:
         self._build_step_list_controls(list_frame)
 
     def _build_steps_tree(self, list_frame):
-        title_frame = ttk.Frame(list_frame)
-        title_frame.pack(fill=tk.X, pady=(0, 5))
-        ttk.Label(title_frame, text="宏步骤序列:", font=("Microsoft YaHei UI", 11, "bold")).pack(side=tk.LEFT)
-
-        tree_frame = ttk.Frame(list_frame)
-        tree_frame.pack(fill=tk.BOTH, expand=True)
-
-        columns = ("id", "action", "params")
-        self.steps_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
-
-        self.steps_tree.heading("id", text="#")
-        self.steps_tree.heading("action", text="动作")
-        self.steps_tree.heading("params", text="参数详情 / 备注")
-
-        self.steps_tree.column("id", width=45, minwidth=40, stretch=False, anchor="center")
-        self.steps_tree.column("action", width=220, minwidth=200, stretch=False)
-        self.steps_tree.column("params", width=320, minwidth=280, stretch=True)
-
-        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.steps_tree.yview)
-        self.steps_tree.configure(yscrollcommand=scrollbar.set)
-
-        self.steps_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.steps_tree.bind("<Double-1>", lambda e: self.load_step_for_edit())
-
-        self.tree_menu = tk.Menu(self.root, tearoff=0, font=self.font_ui)
-        self.tree_menu.add_command(label="屏蔽/启用选中步骤", command=self.toggle_step_enabled)
-        self.steps_tree.bind("<Button-3>", self.show_tree_menu)
-
-        self.steps_tree.tag_configure('editing', background='#FFF3CD')
-        self.steps_tree.tag_configure('disabled', foreground='#999999')
+        return self.step_controller.build_step_tree(list_frame)
 
     def _build_step_list_controls(self, list_frame):
         left_bottom_frame = ttk.Frame(list_frame)
@@ -729,15 +549,10 @@ class MacroApp:
         left_bottom_frame.columnconfigure(0, weight=1); left_bottom_frame.columnconfigure(1, weight=1)
         left_bottom_frame.columnconfigure(2, weight=1); left_bottom_frame.columnconfigure(3, weight=1)
 
-        self.move_up_btn = ttk.Button(left_bottom_frame, text="↑ 上移", command=lambda: self.move_step("up"), bootstyle="primary-outline", padding=(10, 6))
-        self.move_up_btn.grid(row=0, column=0, sticky="nsew", padx=(0, 2), pady=(0, 5))
-        self.move_down_btn = ttk.Button(left_bottom_frame, text="↓ 下移", command=lambda: self.move_step("down"), bootstyle="primary-outline", padding=(10, 6))
-        self.move_down_btn.grid(row=0, column=1, sticky="nsew", padx=2, pady=(0, 5))
-        self.remove_btn = ttk.Button(left_bottom_frame, text="🗑 删除选中", command=self.remove_step, bootstyle="danger-outline", padding=(10, 6))
-        self.remove_btn.grid(row=0, column=2, sticky="nsew", padx=2, pady=(0, 5))
-        self.load_step_btn = ttk.Button(left_bottom_frame, text="✎ 修改步骤", command=self.load_step_for_edit, bootstyle="info-outline", padding=(10, 6))
-        self.load_step_btn.grid(row=0, column=3, sticky="nsew", padx=(2, 0), pady=(0, 5))
+        self.step_controller.build_step_controls(left_bottom_frame)
+        self._build_runtime_controls(left_bottom_frame)
 
+    def _build_runtime_controls(self, left_bottom_frame):
         self.run_btn = ttk.Button(left_bottom_frame, text="", command=self.run_macro, bootstyle="success", padding=(15, 10))
         self.run_btn.grid(row=1, column=0, columnspan=4, sticky="nsew", padx=(0, 0), pady=5)
 
@@ -756,95 +571,9 @@ class MacroApp:
         run_enabled_check = ttk.Checkbutton(check_frame, text="启用 RUN 步骤 (注意安全风险)", variable=self.run_enabled_var, bootstyle="danger-round-toggle")
         run_enabled_check.grid(row=1, column=1, sticky="w", padx=2, pady=(0, 5))
 
-    def _build_step_editor_panel(self, main_frame):
-        add_frame = ttk.Labelframe(main_frame, text="添加新步骤", padding=10)
-        add_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=10, expand=False)
-
-        add_frame.pack_propagate(False)
-        add_frame.configure(width=380)
-
-        right_bottom_frame = ttk.Frame(add_frame)
-        right_bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(10,0))
-        right_bottom_frame.columnconfigure(0, weight=2); right_bottom_frame.columnconfigure(1, weight=1)
-
-        self.add_step_btn = ttk.Button(right_bottom_frame, text="＋ 添加到序列 >>", command=self.add_or_update_step, bootstyle="success", padding=(12, 8))
-        self.add_step_btn.grid(row=0, column=0, sticky="nsew", padx=(0, 2), columnspan=2)
-        self.cancel_edit_btn = ttk.Button(right_bottom_frame, text="✕ 取消修改", command=self.cancel_edit_mode, bootstyle="secondary", padding=(10, 6))
-
-        ttk.Label(add_frame, text="选择动作:").pack(anchor="w")
-        self.action_type = ttk.Combobox(add_frame, state="readonly", font=self.font_ui, height=16)
-        self.action_type['values'] = list(MacroSchema.ACTION_TRANSLATIONS.values())
-        self.action_type.current(0)
-
-        self.action_type.pack(anchor="w", fill=tk.X, pady=5)
-        self.action_type.bind("<<ComboboxSelected>>", self._on_action_type_selected)
-        self.action_type.bind("<FocusIn>", self._clear_combobox_text_selection, add="+")
-        self.action_type.bind("<ButtonRelease-1>", self._clear_combobox_text_selection, add="+")
-
-        param_area = ttk.Frame(add_frame)
-        param_area.pack(fill=tk.BOTH, expand=True, pady=5)
-        self._build_scrollable_param_area(param_area)
-
-        self.param_widgets = {}
-
-    def _clear_combobox_text_selection(self, event=None):
-        widget = getattr(event, 'widget', None) if event is not None else getattr(self, 'action_type', None)
-        if widget is None:
-            return
-
-        def clear_selection():
-            try:
-                widget.selection_clear()
-                widget.icursor(tk.END)
-            except tk.TclError:
-                pass
-
-        try:
-            widget.after_idle(clear_selection)
-        except tk.TclError:
-            pass
-
-    def _on_action_type_selected(self, event):
-        self.update_param_fields(event)
-        self._clear_combobox_text_selection(event)
-
-    def _build_scrollable_param_area(self, parent):
-        parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(0, weight=1)
-        self._param_scroll_ctrl = _ParamScrollbarController(parent, self.root)
-        # The form builder uses frame; scrollbar internals stay controller-owned.
-        self.param_frame = self._param_scroll_ctrl.frame
-
-
     # ================================================================
     # Window And Status Helpers
     # ================================================================
-
-    def _get_selected_index(self):
-        """获取当前选中项的索引"""
-        selected_items = self.steps_tree.selection()
-        if not selected_items: return None
-        return self.steps_tree.index(selected_items[0])
-
-    def _get_current_action_key(self):
-        return MacroSchema.ACTION_KEYS_TO_NAME.get(self.action_type.get())
-
-    def _set_entry_text(self, entry_widget, value):
-        entry_widget.delete(0, tk.END)
-        entry_widget.insert(0, str(value))
-
-    def _set_param_widget_value(self, key, display_val):
-        """按 widget 类型分发赋值（BooleanVar / Combobox / Entry）。"""
-        w = self.param_widgets[key]
-        if isinstance(w, tk.BooleanVar):
-            w.set(display_val)
-        elif isinstance(w, ttk.Combobox):
-            w.set(display_val)
-        else:
-            self._set_entry_text(w, display_val)
-
-    def _format_region_box(self, region_box):
-        return f"{region_box[0]}, {region_box[1]}, {region_box[2]}, {region_box[3]}"
 
     def _get_hotkey_display_pair(self):
         run_display = capitalize_hotkey_str(self.hotkey_run_str.get())
@@ -885,21 +614,38 @@ class MacroApp:
     def open_hotkey_settings(self):
         """打开快捷键设置对话框"""
         dialog = HotkeySettingsDialog(
-            self.root, 
-            self.hotkey_run_str.get(), 
+            self.root,
+            self.hotkey_run_str.get(),
             self.hotkey_stop_str.get(),
             default_run=DEFAULT_HOTKEY_RUN,
             default_stop=DEFAULT_HOTKEY_STOP
         )
         self.root.wait_window(dialog.dialog)
-        
+
         if dialog.result:
             new_run, new_stop = dialog.result
+            conflicts = self.step_controller.get_press_key_hotkey_conflicts({
+                "运行宏": new_run,
+                "停止宏": new_stop,
+            })
+            if conflicts:
+                details = "\n".join(
+                    f"步骤 {index}: {capitalize_hotkey_str(key_chord)} "
+                    f"与“{purpose}”快捷键冲突"
+                    for index, purpose, key_chord in conflicts
+                )
+                messagebox.showwarning(
+                    "步骤快捷键冲突",
+                    "新的全局快捷键与已有“按下按键”步骤冲突，设置未保存。\n\n"
+                    f"{details}\n\n请先修改冲突步骤或选择其他全局快捷键。",
+                    parent=self.root,
+                )
+                return
             self.hotkey_run_str.set(new_run)
             self.hotkey_stop_str.set(new_stop)
-            
+
             self.on_save_hotkeys()
-            
+
             messagebox.showinfo(
                 "设置已保存",
                 f"快捷键已更新:\n\n"
@@ -910,19 +656,21 @@ class MacroApp:
 
     def on_save_hotkeys(self):
         """保存并重启监听器"""
+        self.step_controller.stop_input_capture()
         self.save_app_settings()
-        
+
         if not self.hotkey_manager.check_conflicts(show_success=False):
             messagebox.showwarning("冲突警告", "快捷键已保存，但检测到冲突。\n请确保没有其他程序占用它。", parent=self.root)
-        
+
         self.hotkey_manager.restart_listener()
+        self.step_controller.refresh_coordinate_capture()
         self.update_status_bar_hotkeys()
 
     def open_vlm_settings(self):
         """打开 VLM (AI) 设置对话框"""
         dialog = VLMSettingsDialog(self.root)
         self.root.wait_window(dialog.dialog)
-        
+
         if dialog.result:
             messagebox.showinfo("设置已保存", "AI 配置已更新", parent=self.root)
 
@@ -931,7 +679,7 @@ class MacroApp:
         if hasattr(self, '_about_dialog_ref') and self._about_dialog_ref and self._about_dialog_ref.dialog.winfo_exists():
             self._about_dialog_ref.dialog.focus_force()
             return
-            
+
         icon_path = get_icon_path(APP_ICON, APP_VERSION)
         self._about_dialog_ref = AboutDialog(self.root, APP_VERSION, icon_path)
 
@@ -940,22 +688,21 @@ class MacroApp:
         self.safe_stop_macro()
         if self.current_run_context:
             macro_engine.cleanup_active_processes(self.current_run_context)
-        
+
         # [变更] 使用 MouseTracker 类停止
         self.mouse_tracker.stop()
-            
-        if self.hotkey_manager and self.hotkey_manager.listener:
+
+        if self.hotkey_manager:
             logger.info("正在停止快捷键监听器...")
             try:
-                self.hotkey_manager.listener.stop()
-                self.hotkey_manager.listener.join(timeout=0.5) 
+                self.hotkey_manager.shutdown()
             except Exception:
                 logger.exception("停止监听器时出错")
-                
+
         try:
             self.root.quit()
             self.root.destroy()
-        except Exception: 
+        except Exception:
             pass
 
 
@@ -963,597 +710,9 @@ class MacroApp:
     # Action Parameter Form
     # ================================================================
 
-    def update_param_fields(self, event):
-        self.last_test_location = None
-        
-        # [变更] 停止鼠标追踪
-        self.mouse_tracker.stop()
-        self.mouse_pos_var.set("")
-        
-        for widget in self.param_frame.winfo_children(): widget.destroy()
-        self.param_widgets = {}
-        action_key = self._get_current_action_key()
-        if not action_key: return
-        
-        # 准备表单回调函数字典
-        callbacks = {
-            'on_select_region': self.on_select_region,
-            'on_preview_region': self.on_preview_region,
-            'browse_image': self.browse_image,
-            'on_test_find_image_click': self.on_test_find_image_click,
-            'on_test_find_text_click': self.on_test_find_text_click,
-            'on_test_ai_command_click': self.on_test_ai_command_click,
-            'update_loop_params': lambda event: update_loop_params(self.param_widgets, self.param_frame, self.param_widgets.get('mode')) if self.param_widgets.get('mode') is not None else None,
-            'update_run_params': lambda event: update_run_params(self.param_widgets, self.param_frame, self.param_widgets.get('run_type')) if self.param_widgets.get('run_type') is not None else None,
-            'mouse_tracker': self.mouse_tracker,
-            'mouse_pos_var': self.mouse_pos_var
-        }
-
-        # 使用表单工厂构建参数控件
-        res = self.widget_factory.build_action_form(
-            action_key, 
-            self.param_frame, 
-            self.param_widgets, 
-            self.available_ocr_keys, 
-            callbacks
-        )
-
-        # 处理特殊返回 (如 OCR 不可用时自动切回图像模式)
-        if res == "SWITCH_TO_FIND_IMAGE":
-            self.action_type.set(MacroSchema.ACTION_TRANSLATIONS['FIND_IMAGE'])
-            self.update_param_fields(None)
-            return
-
-        self._param_scroll_ctrl.refresh()
-
-
     # ================================================================
     # Region Selection
     # ================================================================
-
-    def on_preview_region(self, entry_widget):
-        raw_region = entry_widget.get().strip()
-        if not raw_region:
-            messagebox.showinfo("区域预览", "请先框选或输入搜索范围。")
-            return
-
-        region = parse_region_string(raw_region)
-        if not region or region[2] <= region[0] or region[3] <= region[1]:
-            messagebox.showwarning(
-                "区域预览",
-                "搜索范围无效，应为 x1, y1, x2, y2，且 x2 > x1、y2 > y1。",
-            )
-            return
-
-        try:
-            RegionPreviewOverlay(self.root, region, duration_ms=1500)
-        except (TypeError, ValueError, tk.TclError) as e:
-            messagebox.showwarning("区域预览", f"无法显示搜索范围：{e}")
-    def on_select_region(self, entry_widget):
-        self.root.iconify()
-        self.root.after(300, lambda: self._do_select_region(entry_widget))
-
-    def _do_select_region(self, entry_widget):
-        
-        try:
-            # [变更] 使用 gui_utils 中的 RegionSelector
-            region = RegionSelector(self.root).get_region()
-            self.root.deiconify()
-            
-            if region:
-                val_str = f"{region[0]}, {region[1]}, {region[2]}, {region[3]}"
-                self._set_entry_text(entry_widget, val_str)
-        except Exception as e:
-            self.root.deiconify()
-            messagebox.showerror("错误", f"选区失败: {e}")
-
-
-    # ================================================================
-    # Manual Test Actions
-    # ================================================================
-
-    def on_test_find_image_click(self):
-        try:
-            path = self.param_widgets['path'].get()
-            conf = float(self.param_widgets['confidence'].get())
-            if not os.path.exists(path): raise FileNotFoundError
-            
-            # <--- 读取搜索范围
-            region_box = self._read_test_region_box()
-
-            self._begin_background_test("测试中...", self._test_find_image, (path, conf, region_box))
-        except Exception as e:
-            messagebox.showerror('错误', f"参数无效: {e}")
-
-    def on_test_find_text_click(self):
-        try:
-            text = self.param_widgets['text'].get()
-            lang = MacroSchema.LANG_OPTIONS.get(self.param_widgets['lang'].get(), 'eng')
-            
-            # 获取下拉框的原始值
-            engine_name = self.param_widgets['engine'].get()
-            
-            # <--- 优先检查是否不可用
-            if engine_name.endswith(" (不可用)"):
-                messagebox.showwarning(
-                    "引擎不可用", 
-                    f"您选择的引擎 '{engine_name}' 在当前环境中未安装或无法加载。\n\n请选择其他引擎，或安装相应组件后重启程序。",
-                    parent=self.root
-                )
-                return # 直接阻断测试，不再往下执行
-            
-            engine = self.FULL_OCR_KEY_MAP.get(engine_name, 'auto')
-            
-            region_box = self._read_test_region_box()
-            
-            if not text: raise ValueError
-            self._begin_background_test("测试中...", self._test_find_text, (text, lang, engine, region_box))
-        except Exception as e:
-            messagebox.showerror('错误', f"参数无效: {e}")
-
-    def on_test_ai_command_click(self):
-        """手动测试 AI 指令识别。"""
-        try:
-            instruction = self.param_widgets['instruction'].get()
-            if not instruction.strip():
-                messagebox.showwarning("提示", "请输入 AI 指令")
-                return
-            region_box = self._read_test_region_box()
-            self._begin_background_test("AI 分析中...", self._test_ai_command, (instruction, region_box))
-        except Exception as e:
-            messagebox.showerror('错误', f"参数无效: {e}")
-
-    def _run_test_after_iconify(self, func, args, attempts=0):
-        if self.root.state() == 'iconic' or attempts >= 15:
-            self.root.after(250, lambda: self._run_test_thread(func, args))
-            return
-        self.root.after(100, lambda: self._run_test_after_iconify(func, args, attempts + 1))
-
-    def _test_ai_command(self, instruction, region_box=None):
-        """后台执行 AI 指令测试"""
-        try:
-            _region_box_to_screenshot_region(region_box)
-            coords = vlm_engine.find_location_by_vlm(instruction, region=region_box)
-            self._queue_ui_callback(lambda coords=coords: self._on_test_ai_complete(coords))
-        except Exception as e:
-            self._queue_ui_callback(lambda err=e: self._on_test_error(err))
-
-    def _on_test_ai_complete(self, coords):
-        """AI 测试完成回调"""
-        self._restore_main_window_after_test()
-        if coords and len(coords) >= 2:
-            self.last_test_location = (coords[0], coords[1])
-            pyautogui.moveTo(coords[0], coords[1])
-            messagebox.showinfo("AI 成功", f"找到坐标: {self.last_test_location}\n\nAI 已移动鼠标到该位置")
-        else:
-            messagebox.showwarning("AI 失败", "未能从 AI 获取有效坐标\n\n请检查:\n1. API Key 是否正确配置\n2. 网络是否正常\n3. 指令是否清晰")
-        self.update_status_bar_hotkeys()
-        self.root.attributes('-topmost', False)
-
-    def _run_test_thread(self, func, args):
-        threading.Thread(target=func, args=args, daemon=True).start()
-
-    def _test_find_image(self, path, conf, region_box=None):
-        screenshot = None
-        try:
-            screenshot_region = _region_box_to_screenshot_region(region_box)
-            screenshot, offset = macro_engine.smart_screenshot(screenshot_region)
-                
-            res_val = macro_engine.find_image_cv2(path, conf, screenshot_pil=screenshot, offset=offset)
-            loc = res_val[0] if res_val else None
-            self._queue_ui_callback(lambda loc=loc: self._on_test_complete(loc))
-        except Exception as e: 
-            self._queue_ui_callback(lambda err=e: self._on_test_error(err))
-        finally:
-            if screenshot:
-                try: screenshot.close()
-                except Exception: pass
-
-    def _test_find_text(self, text, lang, engine, region_box=None):
-        screenshot = None
-        try:
-            screenshot_region = _region_box_to_screenshot_region(region_box)
-            screenshot, offset = macro_engine.smart_screenshot(screenshot_region)
-            
-            loc = ocr_engine.find_text_location(text, lang, True, screenshot_pil=screenshot, offset=offset, engine=engine)
-            self._queue_ui_callback(lambda loc=loc: self._on_test_complete(loc))
-        except Exception as e: 
-            self._queue_ui_callback(lambda err=e: self._on_test_error(err))
-        finally:
-            if screenshot:
-                try: screenshot.close()
-                except Exception: pass
-
-    def _read_test_region_box(self):
-        region_widget = self.param_widgets.get('region')
-        if region_widget is None:
-            return None
-        return _parse_optional_test_region(region_widget.get())
-
-    def _begin_background_test(self, status_text, func, args):
-        self.status_var.set(status_text)
-        self.root.iconify()
-        self._run_test_after_iconify(func, args)
-
-    def _restore_main_window_after_test(self):
-        self.root.deiconify()
-        self.root.attributes('-topmost', True)
-
-    def _on_test_complete(self, loc):
-        self._restore_main_window_after_test()
-
-        x, y = None, None
-        
-        if loc and len(loc) >= 2:
-            # 兼容两种格式:
-            # 1. (x, y) - 图像查找返回
-            # 2. ((x, y), text) - OCR返回
-            first = loc[0]
-            if isinstance(first, tuple) and len(first) >= 2:
-                # 格式2: ((x, y), text)
-                x, y = first[0], first[1]
-            else:
-                # 格式1: (x, y)
-                x, y = loc[0], loc[1]
-        
-        if x is not None and y is not None:
-            self.last_test_location = (x, y)
-            pyautogui.moveTo(x, y)
-            messagebox.showinfo("成功", f"找到于 {self.last_test_location}")
-        else:
-            messagebox.showwarning("失败", "未找到目标")
-        
-        self.update_status_bar_hotkeys()
-        self.root.attributes('-topmost', False)
-
-    def _on_test_error(self, e):
-        self._restore_main_window_after_test()
-        error_msg = str(e)
-        messagebox.showerror("错误", error_msg)
-        self.update_status_bar_hotkeys()
-
-
-    # ================================================================
-    # Step Editing
-    # ================================================================
-
-    def browse_image(self):
-        """浏览图片文件（保持向后兼容）"""
-        f = filedialog.askopenfilename(filetypes=[("PNG", "*.png"), ("All", "*.*")])
-        if f: 
-            f = os.path.abspath(f) 
-            self._set_entry_text(self.param_widgets['path'], f)
-
-    def _build_step_from_form(self, action):
-        params, error = self.widget_factory.collect_step_data(action, self.param_widgets, self.FULL_OCR_KEY_MAP)
-        if error:
-            messagebox.showwarning("输入错误", error)
-            return None
-
-        if getattr(self, 'editing_step_has_cache_box', False) and 'region' in params:
-            params['cache_box'] = params.pop('region')
-
-        return {"action": action, "params": params}
-
-    def _maybe_apply_test_cache(self, step, action):
-        if action not in ('FIND_TEXT', 'FIND_IMAGE', 'IF_TEXT_FOUND', 'IF_IMAGE_FOUND'):
-            return
-        if self.editing_index is not None or not self.last_test_location:
-            return
-        if 'region' in step['params'] or 'cache_box' in step['params']:
-            return
-        if messagebox.askyesno("缓存", "使用测试坐标作为缓存？"):
-            x, y = self.last_test_location
-            step["params"]["cache_box"] = [x, y, x + 1, y + 1]
-
-    def _upsert_step(self, step):
-        if self.editing_index is not None:
-            target_index = self.editing_index
-            self.steps[target_index] = step
-            self.cancel_edit_mode()
-            return target_index
-
-        selected_idx = self._get_selected_index()
-        if selected_idx is None:
-            self.steps.append(step)
-            target_index = len(self.steps) - 1
-        else:
-            target_index = selected_idx + 1
-            self.steps.insert(target_index, step)
-
-        self.update_listbox_display()
-        return target_index
-
-    def add_or_update_step(self):
-        """添加新步骤或更新当前编辑中的步骤。"""
-        action = self._get_current_action_key()
-        if not action:
-            return
-
-        step = self._build_step_from_form(action)
-        if step is None:
-            return
-
-        self._maybe_apply_test_cache(step, action)
-        target_index = self._upsert_step(step)
-        self._select_step_tree_index(target_index)
-        self.last_test_location = None
-
-
-    def _apply_loop_mode_for_edit(self, params):
-        saved_mode = params.get('mode', 'fixed')
-        default_display = next(iter(gui_utils.LOOP_MODE_OPTIONS.keys()))
-        display_mode = gui_utils.LOOP_MODE_DISPLAY_BY_VALUE.get(saved_mode, default_display)
-        mode_widget = self.param_widgets.get('mode')
-        if mode_widget is not None:
-            mode_widget.set(display_mode)
-            update_loop_params(self.param_widgets, self.param_frame, mode_widget)
-
-    def _apply_run_type_for_edit(self, params):
-        saved_run_type = params.get('run_type', 'command')
-        default_display = next(iter(MacroSchema.RUN_TYPE_OPTIONS.keys()))
-        display_run_type = MacroSchema.RUN_TYPE_DISPLAY_BY_VALUE.get(saved_run_type, default_display)
-        run_type_widget = self.param_widgets.get('run_type')
-        if run_type_widget is not None:
-            run_type_widget.set(display_run_type)
-            update_run_params(self.param_widgets, self.param_frame, run_type_widget)
-
-    def _prepare_action_form_for_edit(self, step):
-        self.action_type.set(MacroSchema.ACTION_TRANSLATIONS.get(step['action']))
-        self.update_param_fields(None)
-        self._clear_combobox_text_selection()
-
-        if step['action'] == 'LOOP_START':
-            self._apply_loop_mode_for_edit(step['params'])
-        elif step['action'] == 'RUN':
-            self._apply_run_type_for_edit(step['params'])
-
-    def _fill_region_param_for_edit(self, params):
-        if 'region' not in self.param_widgets:
-            return
-        region_box = params.get('region', params.get('cache_box'))
-        self.editing_step_has_cache_box = ('cache_box' in params and 'region' not in params)
-        if isinstance(region_box, list) and len(region_box) == 4:
-            self._set_entry_text(self.param_widgets['region'], self._format_region_box(region_box))
-
-    def _display_value_for_param(self, key, value):
-        if key not in ('lang', 'button', 'engine'):
-            return value
-        return param_internal_to_display(
-            key, value,
-            self.FULL_OCR_NAME_MAP,
-            MacroSchema.LANG_VALUES_TO_NAME,
-            MacroSchema.CLICK_VALUES_TO_NAME,
-            self.available_ocr_keys
-        )
-
-    def _fill_regular_params_for_edit(self, params):
-        for key, value in params.items():
-            if key in ('mode', 'run_type', 'cache_box', 'region'):
-                continue
-            if key not in self.param_widgets:
-                continue
-            self._set_param_widget_value(key, self._display_value_for_param(key, value))
-
-    def _enter_edit_mode(self, index):
-        self.editing_index = index
-        self.add_step_btn.config(text="[OK] 更新步骤", bootstyle="warning")
-        self.add_step_btn.grid_configure(columnspan=1)
-        self.cancel_edit_btn.grid(row=0, column=1, sticky="nsew", padx=(2, 0))
-        self.update_listbox_display()
-
-    def load_step_for_edit(self):
-        """加载选中步骤到编辑区。"""
-        idx = self._get_selected_index()
-        if idx is None:
-            return
-
-        step = self.steps[idx]
-        self._prepare_action_form_for_edit(step)
-        self._fill_region_param_for_edit(step['params'])
-        self._fill_regular_params_for_edit(step['params'])
-        self._enter_edit_mode(idx)
-
-    def cancel_edit_mode(self):
-        self.editing_index = None
-        self.editing_step_has_cache_box = False  # 重置标志
-        self.add_step_btn.config(text="＋ 添加到序列 >>", bootstyle="success")
-        self.cancel_edit_btn.grid_remove()
-        self.add_step_btn.grid_configure(columnspan=2)
-        self.update_listbox_display()
-
-
-    # ================================================================
-    # Step List Rendering
-    # ================================================================
-
-    def _format_step_params(self, step, act):
-        # 参数预览文本
-        display_params = step['params'].copy()
-        
-        cache_str = ""
-        if 'region' in display_params or 'cache_box' in display_params:
-            box = display_params.pop('region', display_params.pop('cache_box', None))
-            if isinstance(box, (list, tuple)) and len(box) >= 4:
-                cache_str = f"[区域: {box[0]},{box[1]},{box[2]},{box[3]}] "
-            elif box is not None:
-                cache_str = "[区域: 无效] "
-
-        if 'engine' in display_params:
-            # <--- 列表显示时也使用完整映射
-            display_params['engine'] = self.FULL_OCR_NAME_MAP.get(display_params['engine'], display_params['engine'])
-            
-        # 格式化参数列字符串
-        param_text = f"{cache_str}{display_params}" if display_params else ""
-        
-        # 备注动作特殊处理：显示为注释格式
-        if act == 'NOTE':
-            note_text = step['params'].get('text', '')
-            param_text = f"// {note_text}" if note_text else "// (空备注)"
-
-        formatter = _STEP_PARAM_PREVIEW_FORMATTERS.get(act)
-        if formatter:
-            param_text = formatter(step['params'])
-        
-        # 插入行 (Values对应: id, action, params)
-        return param_text
-
-    def _get_step_display_indent(self, action, block_stack):
-        return max(0, len(block_stack) - (1 if action in _LIST_DEDENT_ACTIONS else 0))
-
-    def _update_display_block_stack(self, action, block_stack):
-        if _is_list_block_start(action):
-            block_stack.append(action)
-        elif action in _LIST_BLOCK_END_ACTIONS and block_stack:
-            block_stack.pop()
-
-    def _get_step_tree_tags(self, index, is_enabled):
-        tags = []
-        if index == self.editing_index:
-            tags.append('editing')
-        if not is_enabled:
-            tags.append('disabled')
-        return tuple(tags)
-
-    def _build_step_tree_row(self, index, step, block_stack):
-        act = step['action']
-        indent_str = "    " * self._get_step_display_indent(act, block_stack)
-        param_text = self._format_step_params(step, act)
-        action_label = MacroSchema.ACTION_TRANSLATIONS.get(act, act)
-        is_enabled = step.get('enabled', True)
-
-        display_action = f"{indent_str}{action_label}"
-        if not is_enabled:
-            display_action = f"{indent_str}[屏蔽] {action_label}"
-
-        values = (index + 1, display_action, param_text)
-        tags = self._get_step_tree_tags(index, is_enabled)
-        return act, values, tags
-
-
-    def _select_step_tree_item(self, item_id, ensure_visible=True):
-        if ensure_visible:
-            self.steps_tree.see(item_id)
-        self.steps_tree.selection_set(item_id)
-
-    def _select_step_tree_index(self, index, ensure_visible=True):
-        children = self.steps_tree.get_children()
-        if 0 <= index < len(children):
-            self._select_step_tree_item(children[index], ensure_visible)
-            return True
-        return False
-
-    def _focus_step_tree_item_if_editing(self, index, item_id):
-        if index == self.editing_index:
-            self._select_step_tree_item(item_id)
-
-    def update_listbox_display(self):
-        """Refresh the Treeview display."""
-        for item in self.steps_tree.get_children():
-            self.steps_tree.delete(item)
-
-        block_stack = []
-        for i, step in enumerate(self.steps):
-            act, values, tags = self._build_step_tree_row(i, step, block_stack)
-            item_id = self.steps_tree.insert("", "end", values=values)
-            if tags:
-                self.steps_tree.item(item_id, tags=tags)
-
-            self._focus_step_tree_item_if_editing(i, item_id)
-            self._update_display_block_stack(act, block_stack)
-
-
-    # ================================================================
-    # Step List Commands
-    # ================================================================
-
-    def _is_step_toggle_allowed(self, index):
-        action = self.steps[index].get('action', '')
-        return action not in MacroSchema.CONTROL_FLOW_ACTIONS
-
-    def _set_tree_menu_toggle_state(self, index):
-        state = "normal" if self._is_step_toggle_allowed(index) else "disabled"
-        self.tree_menu.entryconfig(0, state=state)
-
-    def _get_context_menu_step_index(self, event):
-        item = self.steps_tree.identify_row(event.y)
-        if not item:
-            return None
-
-        self._select_step_tree_item(item, ensure_visible=False)
-        return self._get_selected_index()
-
-    def _warn_control_flow_toggle_blocked(self):
-        messagebox.showwarning("提示", "不可屏蔽流程控制节点（条件、循环），以防止引发严重 BUG。", parent=self.root)
-
-    def _toggle_step_enabled_at(self, index):
-        step = self.steps[index]
-        step['enabled'] = not step.get('enabled', True)
-
-    def show_tree_menu(self, event):
-        """Show the step list context menu."""
-        idx = self._get_context_menu_step_index(event)
-        if idx is None:
-            return
-
-        self._set_tree_menu_toggle_state(idx)
-        self.tree_menu.post(event.x_root, event.y_root)
-
-    def toggle_step_enabled(self):
-        """切换选中步骤的启用/屏蔽状态"""
-        idx = self._get_selected_index()
-        if idx is None:
-            return
-
-        if not self._is_step_toggle_allowed(idx):
-            self._warn_control_flow_toggle_blocked()
-            return
-
-        self._toggle_step_enabled_at(idx)
-        self.update_listbox_display()
-
-    def remove_step(self):
-        # --- 升级: 适配 Treeview ---
-        idx = self._get_selected_index()
-        if idx is None: return
-        
-        # [修复] 使用 elif 确保逻辑互斥
-        # 原代码问题: cancel_edit_mode 会将 editing_index 设为 None，
-        # 导致后续的 if 判断永远为 False，索引调整失效
-        if self.editing_index == idx:
-            self.cancel_edit_mode()
-        elif self.editing_index is not None and self.editing_index > idx:
-            self.editing_index -= 1
-            
-        del self.steps[idx]
-        self.update_listbox_display()
-        
-        # 尝试选中下一行
-        children = self.steps_tree.get_children()
-        if idx < len(children):
-             self._select_step_tree_index(idx, ensure_visible=False)
-        elif children:
-             self._select_step_tree_index(len(children) - 1, ensure_visible=False)
-
-    def move_step(self, d):
-        # --- 升级: 适配 Treeview ---
-        idx = self._get_selected_index()
-        if idx is None: return
-        
-        i = idx
-        new_i = i - 1 if d == "up" else i + 1
-        
-        if 0 <= new_i < len(self.steps):
-            self.steps.insert(new_i, self.steps.pop(i))
-            
-            # 同步更新 editing_index
-            if self.editing_index == i: self.editing_index = new_i
-            elif self.editing_index == new_i: self.editing_index = i
-            self.update_listbox_display()
-            
-            # 保持选中移动后的项
-            self._select_step_tree_index(new_i)
-
 
     # ================================================================
     # Macro Run And Stop
@@ -1561,8 +720,8 @@ class MacroApp:
 
     def safe_run_macro(self):
         # 步骤为空时给出明确提示，而非静默无响应
-        if not self.is_macro_running and not self._run_pending and self.editing_index is None:
-            if not self.steps:
+        if not self.is_macro_running and not self._run_pending and not self.step_controller.is_editing():
+            if not self.step_controller.has_steps():
                 self.root.after(0, self.status_var.set, '提示: 宏为空，请先添加步骤再运行')
                 return
             self.root.after(0, self.run_macro, True)
@@ -1577,27 +736,28 @@ class MacroApp:
                 break
         return cleared
     def run_macro(self, hotkey=False):
-        if self.is_macro_running or self._run_pending or not self.steps: return
+        if self.is_macro_running or self._run_pending or not self.step_controller.has_steps(): return
         stop_display = capitalize_hotkey_str(self.hotkey_stop_str.get())
-        
+
         if not hotkey and not self.skip_confirm_var.get():
             if not messagebox.askyesno("运行", f"是否立即开始？(按 {stop_display} 停止)"): return
 
-        run_steps = [s for s in self.steps if s.get('action') == 'RUN' and s.get('enabled', True)]
-        if run_steps and self.run_enabled_var.get() and not hotkey and not self.skip_confirm_var.get():
+        run_step_count = self.step_controller.count_enabled_action('RUN')
+        if run_step_count and self.run_enabled_var.get() and not hotkey and not self.skip_confirm_var.get():
             if not messagebox.askyesno(
                 "安全警告",
-                f"此宏包含 {len(run_steps)} 个执行外部命令的步骤（RUN）。\n\n"
+                f"此宏包含 {run_step_count} 个执行外部命令的步骤（RUN）。\n\n"
                 "执行外部命令可能存在安全风险，请确保来源可信。\n\n"
                 "是否继续运行？\n"
                 "(可在左下角开关中永久禁用 RUN 步骤)"
             ): return
-            
-        self.loop_status_var.set("") 
-        
+
+        self.step_controller.stop_input_capture()
+        self.loop_status_var.set("")
+
         # 清空之前的状态队列，防止积压
         self._clear_status_queue()
-            
+
         self.run_btn.config(state="disabled")
         self.status_var.set(f"宏正在运行... [{stop_display}] 停止")
 
@@ -1629,13 +789,16 @@ class MacroApp:
         self._pending_run_id = None
         self.is_macro_running = True
         self.current_run_context = self._build_run_context()
-        self._macro_thread = threading.Thread(target=self._run, args=(copy.deepcopy(self.steps),), daemon=True)
+        steps_snapshot = self.step_controller.get_steps_snapshot()
+        self._macro_thread = threading.Thread(
+            target=self._run, args=(steps_snapshot,), daemon=True
+        )
         self._macro_thread.start()
 
     def _build_run_context(self):
-        """组装宏运行上下文字典（供 core_engine.execute_steps 使用）。"""
+        """Build the RunContext passed to core_engine.execute_steps."""
         macro_base_dir = os.path.dirname(self.current_filepath) if self.current_filepath else os.getcwd()
-        return {
+        return macro_engine.RunContext({
             'stop_requested': False,
             'stop_event': threading.Event(),
             'stop_key_str': self.hotkey_stop_str.get(),
@@ -1645,7 +808,7 @@ class MacroApp:
             'allowed_file_roots': [macro_base_dir, os.getcwd(), APP_DIR],
             'prompt_input_callback': self._prompt_input_for_macro,
             'allow_force_thread_stop': True,
-        }
+        })
 
     def _prompt_input_for_macro(self, title, prompt, default_value='', ctx=None):
         done = threading.Event()
@@ -1687,7 +850,16 @@ class MacroApp:
 
     def _run(self, steps):
         try:
-            macro_engine.execute_steps(steps, run_context=self.current_run_context, status_callback=self.update_loop_status)
+            succeeded = macro_engine.execute_steps(
+                steps,
+                run_context=self.current_run_context,
+                status_callback=self.update_loop_status,
+            )
+            if not succeeded:
+                self._queue_ui_callback(lambda: messagebox.showwarning(
+                    "执行未完成",
+                    "宏未完整执行。请检查状态信息和日志以确定失败步骤。",
+                ))
         except macro_engine.MacroStopException:
             logger.info("已将循环强制中断")
         except Exception as e:
@@ -1731,7 +903,11 @@ class MacroApp:
         if not tid:
             logger.error("中断: thread ID invalid; exception not injected")
             return
-        if not (self.current_run_context or {}).get('allow_force_thread_stop', False):
+        force_stop_enabled = bool(
+            self.current_run_context
+            and self.current_run_context.get_option('allow_force_thread_stop', False)
+        )
+        if not force_stop_enabled:
             logger.warning("Stop: cooperative stop timed out; force thread injection is disabled")
             if self.current_run_context:
                 macro_engine.cleanup_active_processes(self.current_run_context)
@@ -1765,7 +941,8 @@ class MacroApp:
         self.current_run_context = None
 
         self._restore_macro_idle_ui()
-        self.update_status_bar_hotkeys() 
+        self.step_controller.refresh_coordinate_capture()
+        self.update_status_bar_hotkeys()
 
 
     # ================================================================
@@ -1796,7 +973,7 @@ class MacroApp:
     def _check_status_queue(self):
         """
         [补丁优化] 动态调整状态队列检查频率
-        
+
         优化:
         - 运行时: 50ms (快速响应)
         - 空闲时: 500ms (节省CPU)
@@ -1807,17 +984,17 @@ class MacroApp:
 
         # [补丁优化] 根据运行状态动态调整检查频率
         interval = STATUS_QUEUE_CHECK_INTERVAL_RUNNING if self.is_macro_running else STATUS_QUEUE_CHECK_INTERVAL_IDLE
-        
+
         try:
             text = None
             count = 0
             while not self.status_queue.empty() and count < STATUS_QUEUE_MAX_BATCH:
                 text = self.status_queue.get_nowait()
                 count += 1
-            
+
             if text:
                 self.loop_status_var.set(text)
-            
+
             # [新增] 同步更新迷你窗口（仅在内容变化时刷新）
             if self.mini_status_window:
                 stop_display = capitalize_hotkey_str(self.hotkey_stop_str.get())
@@ -1830,7 +1007,7 @@ class MacroApp:
             pass
         except Exception as e:
             logger.error(f"错误: {e}")
-            
+
         self.root.after(interval, self._check_status_queue)
 
 
@@ -1839,14 +1016,10 @@ class MacroApp:
     # ================================================================
 
     def new_macro(self):
-        if self.steps:
+        if self.step_controller.has_steps():
             if not messagebox.askyesno("新建", "清空当前宏？"): return
-        self.steps = []
-        self.editing_index = None
-        self.last_test_location = None
+        self.step_controller.clear_steps()
         self.current_filepath = None
-        self.cancel_edit_mode()
-        self.update_listbox_display()
         self.update_title()
         self.status_var.set("已新建空白宏。")
 
@@ -1856,10 +1029,17 @@ class MacroApp:
 
     def save_macro(self):
         """保存宏到 JSON 文件。"""
+        steps = self.step_controller.get_steps_snapshot()
+        if not validate_macro_data(steps):
+            messagebox.showerror(
+                "保存失败",
+                "当前步骤的控制结构不完整或嵌套顺序错误，请修正后再保存。",
+            )
+            return
         f = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
         if f:
             try:
-                MacroPersistence.save(f, self.steps)
+                MacroPersistence.save(f, steps)
                 self.current_filepath = f
                 self.update_title()
                 messagebox.showinfo("成功", "宏已保存！")
@@ -1870,25 +1050,23 @@ class MacroApp:
         """从 JSON 文件加载宏。"""
         if not os.path.exists(f):
             messagebox.showerror("失败", "文件不存在")
-            if f in self.recent_files: 
+            if f in self.recent_files:
                 self.recent_files.remove(f); self.save_app_settings(); self.update_recent_files_menu()
             return
         try:
-            self.cancel_edit_mode()
             data = MacroPersistence.load(f)
-            
+
             # 验证JSON数据结构
             if not validate_macro_data(data):
                 messagebox.showerror("加载失败", f"文件格式无效或损坏:\n{os.path.basename(f)}")
                 return
-            
-            self.steps = data
+
+            self.step_controller.load_steps(data)
             self.current_filepath = f
-            self.update_listbox_display()
             self.update_title()
             self.status_var.set(f"已加载: {os.path.basename(f)}")
             self.add_to_recent_files(f)
-        except Exception as e: 
+        except Exception as e:
             messagebox.showerror("加载失败", f"无法加载文件:\n{str(e)}")
 
     def add_to_recent_files(self, f):
@@ -1929,15 +1107,58 @@ class MacroApp:
                 logger.warning("加载应用设置失败，使用默认设置: %s", e)
             return {}
 
+    def _available_theme_names(self):
+        try:
+            names = self.root.style.theme_names()
+        except Exception:
+            names = ()
+        return set(names) or set(KNOWN_THEMES)
+
+    def _normalize_app_settings(self, settings):
+        normalized = dict(settings) if isinstance(settings, dict) else {}
+
+        recent_files = normalized.get('recent_files', [])
+        if not isinstance(recent_files, list):
+            recent_files = []
+        normalized['recent_files'] = [
+            path for path in recent_files
+            if isinstance(path, str) and path.strip()
+        ][:MAX_RECENT_FILES]
+
+        available_themes = self._available_theme_names()
+        theme = normalized.get('theme')
+        if not isinstance(theme, str) or theme not in available_themes:
+            theme = 'litera' if 'litera' in available_themes else sorted(available_themes)[0]
+        normalized['theme'] = theme
+
+        run_hotkey = normalized.get('hotkey_run')
+        stop_hotkey = normalized.get('hotkey_stop')
+        run_hotkey = run_hotkey.strip().lower() if isinstance(run_hotkey, str) else ''
+        stop_hotkey = stop_hotkey.strip().lower() if isinstance(stop_hotkey, str) else ''
+        if not HotkeyUtils.is_valid_hotkey(run_hotkey):
+            run_hotkey = DEFAULT_HOTKEY_RUN
+        if not HotkeyUtils.is_valid_hotkey(stop_hotkey):
+            stop_hotkey = DEFAULT_HOTKEY_STOP
+        if run_hotkey == stop_hotkey:
+            run_hotkey, stop_hotkey = DEFAULT_HOTKEY_RUN, DEFAULT_HOTKEY_STOP
+        normalized['hotkey_run'] = run_hotkey
+        normalized['hotkey_stop'] = stop_hotkey
+
+        for key in ('enhanced_mode', 'run_enabled', 'skip_confirm', 'dont_minimize'):
+            value = normalized.get(key, False)
+            normalized[key] = value if isinstance(value, bool) else False
+        return normalized
+
     def _apply_app_settings(self, settings):
-        self.recent_files = settings.get('recent_files', [])
-        self.current_theme.set(settings.get('theme', 'litera'))
-        self.hotkey_run_str.set(settings.get('hotkey_run', DEFAULT_HOTKEY_RUN))
-        self.hotkey_stop_str.set(settings.get('hotkey_stop', DEFAULT_HOTKEY_STOP))
-        self.enhanced_mode_var.set(settings.get('enhanced_mode', False))
-        self.run_enabled_var.set(settings.get('run_enabled', False))
-        self.skip_confirm_var.set(settings.get('skip_confirm', False))
-        self.dont_minimize_var.set(settings.get('dont_minimize', False))
+        settings = self._normalize_app_settings(settings)
+        self.recent_files = settings['recent_files']
+        self.current_theme.set(settings['theme'])
+        self.hotkey_run_str.set(settings['hotkey_run'])
+        self.hotkey_stop_str.set(settings['hotkey_stop'])
+        self.enhanced_mode_var.set(settings['enhanced_mode'])
+        self.run_enabled_var.set(settings['run_enabled'])
+        self.skip_confirm_var.set(settings['skip_confirm'])
+        self.dont_minimize_var.set(settings['dont_minimize'])
 
     def save_app_settings(self):
         """保存应用设置"""
@@ -1967,15 +1188,24 @@ class MacroApp:
     def _write_app_settings(self, settings):
         os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
         tmp_path = CONFIG_FILE + '.tmp'
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(settings, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, CONFIG_FILE)
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, CONFIG_FILE)
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.debug('Failed to clean app settings temp file', exc_info=True)
+            raise
 
     def change_theme(self):
         self.root.style.theme_use(self.current_theme.get())
         self.root.style.configure(".", font=self.font_ui)
         self.save_app_settings()
-        
+
 
 
 
@@ -2026,13 +1256,13 @@ def _extract_cli_steps(script_data):
 
 def _build_cli_run_context(script_file, enable_run):
     macro_base_dir = os.path.dirname(os.path.abspath(script_file))
-    return {
+    return macro_engine.RunContext({
         'run_enabled': enable_run,
         'stop_requested': False,
         'stop_event': threading.Event(),
         'macro_base_dir': macro_base_dir,
         'allowed_file_roots': [macro_base_dir, os.getcwd(), APP_DIR],
-    }
+    })
 
 
 def _finish_cli_run(result):
@@ -2063,15 +1293,18 @@ def _run_gui_mode(args):
 
 def _resolve_initial_theme(cli_theme):
     """从配置文件解析初始主题，失败时回退到 CLI 指定主题。"""
+    fallback_theme = cli_theme if cli_theme in KNOWN_THEMES else 'litera'
     try:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 theme_config = json.load(f)
             if isinstance(theme_config, dict):
-                return theme_config.get('theme', cli_theme)
+                configured_theme = theme_config.get('theme')
+                if configured_theme in KNOWN_THEMES:
+                    return configured_theme
     except (OSError, json.JSONDecodeError, TypeError):
         pass
-    return cli_theme
+    return fallback_theme
 
 
 if __name__ == "__main__":
