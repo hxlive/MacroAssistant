@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # core_engine.py
 # 功能说明：自动化宏核心执行引擎，负责运行上下文、动作分发、控制流和进程管理
-# Version: 1.8.5
-CORE_VERSION = "1.8.5"
+# Version: 1.8.6
+CORE_VERSION = "1.8.6"
 
 import screen_locator
 # ======================================================================
@@ -104,29 +104,31 @@ class MacroSchema:
         'WAIT':           '05. 等待',
         'TYPE_TEXT':      '06. 输入文本',
         'PRESS_KEY':      '07. 按下按键',
-        'ACTIVATE_WINDOW': '08. 激活窗口 (按标题)',
-        'NOTE':           "09. 备注",
-        'FIND_IMAGE':     '10. 查找图像',
-        'FIND_TEXT':      '11. 查找文本 (OCR)',
-        'IF_IMAGE_FOUND':  '12. IF 找到图像',
-        'IF_TEXT_FOUND':   '13. IF 找到文本',
-        'IF_VAR':         '14. IF 变量比较',
-        'ELSE':           '15. ELSE（否则）',
-        'END_IF':         '16. END_IF（结束 IF）',
-        'LOOP_START':     '17. 循环开始',          # Loop
-        'END_LOOP':       '18. 结束循环',       # EndLoop
-        'SET_VAR':        '19. 设置变量',        # Set Var
-        'CALCULATE':      '20. 变量计算',      # Calculate
-        'EXTRACT_VAR':    '21. 正则提取变量',    # Extract
-        'PROMPT_INPUT':    '22. 人工输入',   # Prompt Input
-        'GOTO_LABEL':     '23. 跳转到标签',
-        'GOTO_IF':        '24. 条件跳转',        # Goto If
-        'READ_FILE':      '25. 读取文本文件到变量',
-        'WRITE_FILE':     '26. 写入文本文件',     # Write File
-        'FOREACH_LINE':    '27. 批量处理文本行',   # Batch Lines
-        'END_FOREACH':     '28. 结束批量处理',
-        'RUN':            '29. 执行命令/脚本',
-        'AI_COMMAND':      '30. AI 自然语言指令',
+        'DRAG_TO':        '08. 按住并拖动',
+        'ACTIVATE_WINDOW': '09. 激活窗口 (按标题)',
+        'NOTE':           "10. 备注",
+        'FIND_IMAGE':     '11. 查找图像',
+        'FIND_TEXT':      '12. 查找文本 (OCR)',
+        'IF_IMAGE_FOUND':  '13. IF 找到图像',
+        'IF_TEXT_FOUND':   '14. IF 找到文本',
+        'IF_COLOR_MATCH':  '15. IF 颜色匹配',
+        'IF_VAR':         '16. IF 变量比较',
+        'ELSE':           '17. ELSE（否则）',
+        'END_IF':         '18. END_IF（结束 IF）',
+        'LOOP_START':     '19. 循环开始',          # Loop
+        'END_LOOP':       '20. 结束循环',       # EndLoop
+        'SET_VAR':        '21. 设置变量',        # Set Var
+        'CALCULATE':      '22. 变量计算',      # Calculate
+        'EXTRACT_VAR':    '23. 正则提取变量',    # Extract
+        'PROMPT_INPUT':    '24. 人工输入',   # Prompt Input
+        'GOTO_LABEL':     '25. 跳转到标签',
+        'GOTO_IF':        '26. 条件跳转',        # Goto If
+        'READ_FILE':      '27. 读取文本文件到变量',
+        'WRITE_FILE':     '28. 写入文本文件',     # Write File
+        'FOREACH_LINE':    '29. 批量处理文本行',   # Batch Lines
+        'END_FOREACH':     '30. 结束批量处理',
+        'RUN':            '31. 执行命令/脚本',
+        'AI_COMMAND':      '32. AI 自然语言指令',
     }
     ACTION_KEYS_TO_NAME = {v: k for k, v in ACTION_TRANSLATIONS.items()}
     RUN_TYPE_OPTIONS = {
@@ -134,7 +136,7 @@ class MacroSchema:
         'script (脚本)': 'script',
     }
     RUN_TYPE_DISPLAY_BY_VALUE = {v: k for k, v in RUN_TYPE_OPTIONS.items()}
-    CONTROL_FLOW_ACTIONS = {'IF_IMAGE_FOUND', 'IF_TEXT_FOUND', 'IF_VAR', 'ELSE', 'END_IF', 'LOOP_START', 'END_LOOP', 'FOREACH_LINE', 'END_FOREACH'}
+    CONTROL_FLOW_ACTIONS = {'IF_IMAGE_FOUND', 'IF_TEXT_FOUND', 'IF_COLOR_MATCH', 'IF_VAR', 'ELSE', 'END_IF', 'LOOP_START', 'END_LOOP', 'FOREACH_LINE', 'END_FOREACH'}
 
     LANG_OPTIONS = {'chi_sim (简体中文)': 'chi_sim', 'eng (英文)': 'eng'}
     LANG_VALUES_TO_NAME = {v: k for k, v in LANG_OPTIONS.items()}
@@ -172,6 +174,7 @@ class RunContext:
         if self._data['stop_requested']:
             stop_event.set()
         self._data.setdefault('last_pos', (None, None))
+        self._data.setdefault('last_locate_pos', (None, None))
         self._data.setdefault('clipboard_var', '')
 
         self._goto_counts = {}
@@ -191,6 +194,7 @@ class RunContext:
     def reset_execution_state(self):
         self._goto_counts.clear()
         self.set_current_step_index(None)
+        self.set_last_locate_pos(None, None)
 
     def set_current_step_index(self, index):
         self._current_step_index = index
@@ -262,6 +266,16 @@ class RunContext:
     def set_last_pos(self, x, y=None):
         self._data['last_pos'] = x if y is None else (x, y)
 
+    def get_last_locate_pos(self):
+        """Return the center of the latest successful image/OCR recognition."""
+        return self._data.setdefault('last_locate_pos', (None, None))
+
+    def set_last_locate_pos(self, x, y=None):
+        if y is None and isinstance(x, (list, tuple)):
+            self._data['last_locate_pos'] = tuple(x)
+        else:
+            self._data['last_locate_pos'] = (x, y)
+
     def get_clipboard_var(self, default=''):
         return self._data.get('clipboard_var', default)
 
@@ -328,6 +342,28 @@ def _safe_param_float(p, name, default=None, min_value=None, max_value=None):
     if value is None or (isinstance(value, str) and not value.strip()):
         value = default
     return _safe_float(value, default, min_value=min_value, max_value=max_value)
+
+
+def _time_param_seconds(
+        p, ms_name, legacy_name, default_seconds, *, legacy_unit='seconds'):
+    """Read a new millisecond field or a legacy time field as seconds."""
+    if ms_name in p:
+        milliseconds, ok = _safe_param_float(
+            p, ms_name, default_seconds * 1000.0, min_value=0
+        )
+        return milliseconds / 1000.0, ok, ms_name
+
+    legacy_default = (
+        default_seconds * 1000.0
+        if legacy_unit == 'milliseconds'
+        else default_seconds
+    )
+    legacy_value, ok = _safe_param_float(
+        p, legacy_name, legacy_default, min_value=0
+    )
+    if legacy_unit == 'milliseconds':
+        legacy_value /= 1000.0
+    return legacy_value, ok, legacy_name
 
 
 def _parse_optional_coords_or_break(p, action, x_key='x', y_key='y'):
@@ -511,13 +547,25 @@ def _get_allowed_file_roots(ctx: RunContext):
             continue
     return normalized
 
+
+def _clean_user_file_path(file_path):
+    """Normalize paths pasted from Windows Explorer or returned by Tk dialogs."""
+    cleaned = str(file_path or '').strip()
+    quote_pairs = (("\"", "\""), ("'", "'"), ('“', '”'))
+    for opening, closing in quote_pairs:
+        if len(cleaned) >= 2 and cleaned.startswith(opening) and cleaned.endswith(closing):
+            cleaned = cleaned[len(opening):-len(closing)].strip()
+            break
+    return os.path.normpath(cleaned) if cleaned else ''
+
+
 def _resolve_safe_file_path(file_path, ctx: RunContext, purpose='file access'):
-    file_path = str(file_path or '').strip()
+    file_path = _clean_user_file_path(file_path)
     if not file_path:
         raise ValueError('路径为空')
 
     base_dir = ctx.get_macro_base_dir() or os.getcwd()
-    expanded = os.path.expandvars(os.path.expanduser(file_path))
+    expanded = os.path.normpath(os.path.expandvars(os.path.expanduser(file_path)))
     if not os.path.isabs(expanded):
         expanded = os.path.join(base_dir, expanded)
     resolved = _normalize_path_for_compare(expanded)
@@ -707,8 +755,10 @@ def _move_to_with_stop(x, y, duration=0.0, *, ctx: RunContext, pause_after=True)
     _raise_if_stop_requested(ctx, "Stop requested before mouse move")
     duration = max(0.0, float(duration or 0.0))
     if duration <= 0:
-        pyautogui.moveTo(x, y, duration=0)
+        pyautogui.moveTo(x, y, duration=0, _pause=False)
         _raise_if_stop_requested(ctx, "Stop requested after mouse move")
+        if pause_after:
+            _pause_after_pyautogui_call(ctx)
         return
 
     start_x, start_y = pyautogui.position()
@@ -761,6 +811,37 @@ def _click_with_stop(
     _pause_after_pyautogui_call(ctx)
     _raise_if_stop_requested(ctx, "Stop requested after click")
 
+
+def _force_mouse_up(button):
+    """Release a mouse button even when the pointer is on a failsafe corner."""
+    try:
+        pyautogui.mouseUp(button=button, _pause=False)
+    except pyautogui.FailSafeException:
+        failsafe_enabled = pyautogui.FAILSAFE
+        try:
+            pyautogui.FAILSAFE = False
+            pyautogui.mouseUp(button=button, _pause=False)
+        finally:
+            pyautogui.FAILSAFE = failsafe_enabled
+        raise
+
+
+def _drag_to_with_stop(start_x, start_y, end_x, end_y, button, duration=0.0, *, ctx: RunContext):
+    """Perform one interruptible drag and unconditionally release its button."""
+    _move_to_with_stop(start_x, start_y, 0.0, ctx=ctx, pause_after=False)
+    _raise_if_stop_requested(ctx, "Stop requested before drag")
+    mouse_down_attempted = False
+    try:
+        mouse_down_attempted = True
+        pyautogui.mouseDown(button=button, _pause=False)
+        _raise_if_stop_requested(ctx, "Stop requested after mouse down")
+        _move_to_with_stop(end_x, end_y, duration, ctx=ctx, pause_after=False)
+    finally:
+        if mouse_down_attempted:
+            _force_mouse_up(button)
+    _pause_after_pyautogui_call(ctx)
+    _raise_if_stop_requested(ctx, "Stop requested after drag")
+
 # ======================================================================
 # Expressions and value calculation
 # ======================================================================
@@ -798,13 +879,16 @@ def _handle_click_action(p, ctx: RunContext, status_callback=None):
     if not ok:
         _error_param_skip('CLICK', 'clicks', 'positive integer')
         return _ACTION_SKIP
-    interval_ms, ok = _safe_param_float(p, 'interval', 0.0, min_value=0)
+    interval, ok, interval_key = _time_param_seconds(
+        p, 'interval_ms', 'interval', 0.0, legacy_unit='milliseconds'
+    )
     if not ok:
-        _warn_param_default('CLICK', 'interval', interval_ms)
-    interval = interval_ms / 1000.0
-    duration, ok = _safe_param_float(p, 'duration', 0.0, min_value=0)
+        _warn_param_default('CLICK', interval_key, interval)
+    duration, ok, duration_key = _time_param_seconds(
+        p, 'duration_ms', 'duration', 0.0
+    )
     if not ok:
-        _warn_param_default('CLICK', 'duration', duration)
+        _warn_param_default('CLICK', duration_key, duration)
     coords = _parse_optional_coords_or_break(p, 'CLICK')
     if coords == _ACTION_BREAK:
         return _ACTION_BREAK
@@ -830,11 +914,47 @@ def _handle_move_to_action(p, ctx: RunContext):
     if coords == _ACTION_BREAK:
         return _ACTION_BREAK
     x, y = coords
-    duration, ok = _safe_param_float(p, 'duration', 0.25, min_value=0)
+    duration, ok, duration_key = _time_param_seconds(
+        p, 'duration_ms', 'duration', 0.25
+    )
     if not ok:
-        _warn_param_default('MOVE_TO', 'duration', duration)
+        _warn_param_default('MOVE_TO', duration_key, duration)
     _move_to_with_stop(x, y, duration, ctx=ctx)
     ctx.set_last_pos(x, y)
+    return _ACTION_DONE
+
+
+def _handle_drag_to_action(p, ctx: RunContext):
+    coord_keys = ('start_x', 'start_y', 'end_x', 'end_y')
+    if any(key not in p or not str(p.get(key, '')).strip() for key in coord_keys):
+        logger.error("  DRAG_TO requires start and end coordinates")
+        return _ACTION_BREAK
+
+    start = _parse_required_coords_or_break(
+        p, 'DRAG_TO', x_key='start_x', y_key='start_y',
+    )
+    if start == _ACTION_BREAK:
+        return _ACTION_BREAK
+    end = _parse_required_coords_or_break(
+        p, 'DRAG_TO', x_key='end_x', y_key='end_y',
+    )
+    if end == _ACTION_BREAK:
+        return _ACTION_BREAK
+
+    button = str(p.get('button', 'left')).strip().lower() or 'left'
+    if button not in MacroSchema.CLICK_OPTIONS.values():
+        logger.error("  DRAG_TO invalid mouse button: %s", button)
+        return _ACTION_BREAK
+    duration_ms, ok = _safe_param_int(p, 'duration_ms', 500, min_value=0)
+    duration = duration_ms / 1000.0
+    if not ok:
+        logger.error("  DRAG_TO duration_ms must be a non-negative integer")
+        return _ACTION_BREAK
+
+    _drag_to_with_stop(
+        start[0], start[1], end[0], end[1], button, duration, ctx=ctx,
+    )
+    ctx.set_last_pos(*end)
     return _ACTION_DONE
 
 
@@ -847,9 +967,11 @@ def _handle_move_offset_action(p, ctx: RunContext):
     if offset == _ACTION_BREAK:
         return _ACTION_BREAK
     ox, oy = offset
-    duration, ok = _safe_param_float(p, 'duration', 0.25, min_value=0)
+    duration, ok, duration_key = _time_param_seconds(
+        p, 'duration_ms', 'duration', 0.25
+    )
     if not ok:
-        _warn_param_default('MOVE_OFFSET', 'duration', duration)
+        _warn_param_default('MOVE_OFFSET', duration_key, duration)
     current_x, current_y = pyautogui.position()
     _move_to_with_stop(current_x + ox, current_y + oy, duration, ctx=ctx)
     ctx.set_last_pos(last_x + ox, last_y + oy)
@@ -879,9 +1001,11 @@ def _handle_wait_action(p, ctx: RunContext):
 
 
 def _handle_type_text_action(p, ctx: RunContext):
-    interval, ok = _safe_param_float(p, 'interval', 0.0, min_value=0)
+    interval, ok, interval_key = _time_param_seconds(
+        p, 'interval_ms', 'interval', 0.0
+    )
     if not ok:
-        _warn_param_default('TYPE_TEXT', 'interval', interval)
+        _warn_param_default('TYPE_TEXT', interval_key, interval)
     text = _render_param(p, 'text', ctx)
     if not text:
         logger.warning("  TYPE_TEXT has no text; step skipped")
@@ -1085,9 +1209,18 @@ def _resolve_goto_step(ctx: RunContext, pc, goto_labels, action_name, label, max
 
 
 def _parse_run_timeout(p):
-    timeout, ok = _safe_param_int(p, 'timeout', 30, min_value=1)
+    if 'timeout_ms' in p:
+        timeout_ms, ok = _safe_param_int(p, 'timeout_ms', 30000, min_value=1)
+        timeout = timeout_ms / 1000.0
+        timeout_key = 'timeout_ms'
+    else:
+        timeout, ok = _safe_param_int(p, 'timeout', 30, min_value=1)
+        timeout_key = 'timeout'
     if not ok:
-        logger.warning("  RUN timeout must be a positive integer; using default 30")
+        logger.warning(
+            "  RUN %s must be a positive integer; using default 30000 ms",
+            timeout_key,
+        )
     return timeout
 
 def _handle_run_action(p, ctx: RunContext):
@@ -1127,6 +1260,7 @@ def _handle_calculate_action(p, ctx: RunContext):
 _LINEAR_ACTION_HANDLERS = MappingProxyType({
     'CLICK': _handle_click_action,
     'MOVE_TO': _handle_move_to_action,
+    'DRAG_TO': _handle_drag_to_action,
     'MOVE_OFFSET': _handle_move_offset_action,
     'SCROLL': _handle_scroll_action,
     'WAIT': _handle_wait_action,
@@ -1342,11 +1476,11 @@ def _handle_ai_command_step(p, ctx: RunContext):
     if result.found:
         target_x, target_y = result.position
         logger.info("  AI returned position: (%s, %s)", target_x, target_y)
-        duration, ok = _safe_param_float(
-            p, 'duration', 0.25, min_value=0
+        duration, ok, duration_key = _time_param_seconds(
+            p, 'duration_ms', 'duration', 0.25
         )
         if not ok:
-            _warn_param_default('AI_COMMAND', 'duration', duration)
+            _warn_param_default('AI_COMMAND', duration_key, duration)
         _move_to_with_stop(target_x, target_y, duration, ctx=ctx)
         ctx.set_last_pos(target_x, target_y)
         return 'done'
@@ -1356,8 +1490,53 @@ def _handle_ai_command_step(p, ctx: RunContext):
         return 'break'
     return 'done'
 
+
+def _parse_hex_rgb(value):
+    """Parse a strict #RRGGBB color value."""
+    text = str(value).strip()
+    if re.fullmatch(r'#[0-9a-fA-F]{6}', text) is None:
+        raise ValueError("target_color must use #RRGGBB format")
+    return tuple(int(text[index:index + 2], 16) for index in (1, 3, 5))
+
+
+def _color_matches(actual, target, tolerance):
+    """Return whether every RGB channel is within the inclusive tolerance."""
+    return all(abs(int(actual[index]) - int(target[index])) <= tolerance for index in range(3))
+
+
+def _evaluate_color_condition(p, ctx: RunContext):
+    x, x_ok = _safe_param_int(p, 'x')
+    y, y_ok = _safe_param_int(p, 'y')
+    tolerance, tolerance_ok = _safe_param_int(p, 'tolerance', 10, min_value=0, max_value=255)
+    comparison = str(p.get('comparison', 'match')).strip()
+    if not x_ok or not y_ok:
+        raise ValueError('IF_COLOR_MATCH requires integer x and y coordinates')
+    if not tolerance_ok:
+        raise ValueError('IF_COLOR_MATCH tolerance must be an integer from 0 to 255')
+    if comparison not in {'match', 'not_match'}:
+        raise ValueError("IF_COLOR_MATCH comparison must be 'match' or 'not_match'")
+
+    target = _parse_hex_rgb(p.get('target_color', ''))
+    _raise_if_stop_requested(ctx, 'Stop requested before color sampling')
+    actual = screen_locator.sample_screen_pixel(x, y)
+    _raise_if_stop_requested(ctx, 'Stop requested after color sampling')
+    matched = _color_matches(actual, target, tolerance)
+    result = matched if comparison == 'match' else not matched
+    logger.info(
+        '  Color at (%s, %s): #%02X%02X%02X, target #%02X%02X%02X, tolerance %s -> %s',
+        x, y, *actual, *target, tolerance, result,
+    )
+    return result
+
+
 def _handle_find_or_condition_step(steps, pc, act, p, ctx: RunContext):
     next_pc = pc + 1
+    if act == 'IF_COLOR_MATCH':
+        if not _evaluate_color_condition(p, ctx):
+            logger.info("  -> IF condition not met, skipping block")
+            next_pc = _find_jump_or_raise(steps, pc, 'IF_', 'END_IF', ['ELSE', 'END_IF'])
+        return next_pc, 'done'
+
     res = _handle_find_with_retries(act, p, ctx, ctx.locator.is_in_loop())
 
     if act.startswith('IF_'):
@@ -1410,7 +1589,7 @@ def execute_steps(steps, run_context: RunContext | dict | None = None, status_ca
 
             if ctx.check_stop():
                 logger.info(f"  用户请求停止 ({stop_key_display})")
-                break
+                raise MacroStopException("User requested macro stop")
 
             step = steps[pc]
             ctx.set_current_step_index(pc)
@@ -1479,9 +1658,11 @@ def _handle_find_with_retries(act, p, ctx: RunContext, in_loop):
     retry_count, ok = _safe_param_int(p, 'retry_count', 0, min_value=0)
     if not ok:
         _warn_param_default(act, 'retry_count', retry_count)
-    retry_interval, ok = _safe_param_float(p, 'retry_interval', 0, min_value=0)
+    retry_interval, ok, interval_key = _time_param_seconds(
+        p, 'retry_interval_ms', 'retry_interval', 0.0
+    )
     if not ok:
-        _warn_param_default(act, 'retry_interval', retry_interval)
+        _warn_param_default(act, interval_key, retry_interval)
     return _handle_find(
         act, p, ctx, in_loop, retry_count=retry_count,
         retry_interval=retry_interval,
@@ -1527,9 +1708,18 @@ def _build_find_locate_request(
 def _build_find_signature(act, p, ctx: RunContext):
     """Return a step-scoped key for dynamic regions and loop fast paths."""
     target = p.get('path', p.get('text', ''))
-    configured_region = (
-        p.get('region') if p.get('region') is not None else p.get('cache_box')
-    )
+    if p.get('region_mode') == 'relative':
+        configured_region = {
+            'mode': 'relative',
+            'x_offset': p.get('region_x_offset'),
+            'y_offset': p.get('region_y_offset'),
+            'width': p.get('region_width'),
+            'height': p.get('region_height'),
+        }
+    else:
+        configured_region = (
+            p.get('region') if p.get('region') is not None else p.get('cache_box')
+        )
     try:
         region_key = json.dumps(
             configured_region, ensure_ascii=False, sort_keys=True,
@@ -1540,19 +1730,62 @@ def _build_find_signature(act, p, ctx: RunContext):
     return (ctx.get_current_step_index('?'), act, target, region_key)
 
 
+def _resolve_find_region(p, ctx: RunContext):
+    """Resolve an explicitly configured find scope into an absolute BBox.
+
+    Returns ``(region_bbox, constrained)``. Legacy steps without
+    ``region_mode`` keep treating ``region`` as an absolute region; steps
+    without either field remain eligible for the existing runtime cache path.
+    """
+    raw_mode = p.get('region_mode')
+    if raw_mode is None:
+        if p.get('region') is None:
+            return None, False
+        mode = 'absolute'
+    else:
+        mode = str(raw_mode).strip().lower()
+
+    if mode == 'full':
+        return None, False
+
+    if mode == 'absolute':
+        region_bbox = screen_locator.coerce_bbox(p.get('region'))
+        if region_bbox is None:
+            raise ValueError(f"Manual find region is invalid: {p.get('region')}")
+        return region_bbox, True
+
+    if mode != 'relative':
+        raise ValueError(f"Unsupported find region mode: {raw_mode}")
+
+    anchor_x, anchor_y = ctx.get_last_locate_pos()
+    if anchor_x is None or anchor_y is None:
+        raise ValueError(
+            'Relative find region requires a previous successful image or text recognition'
+        )
+
+    x_offset, x_ok = _safe_param_int(p, 'region_x_offset', 0)
+    y_offset, y_ok = _safe_param_int(p, 'region_y_offset', 0)
+    width, width_ok = _safe_param_int(p, 'region_width', min_value=1)
+    height, height_ok = _safe_param_int(p, 'region_height', min_value=1)
+    if not x_ok or not y_ok:
+        raise ValueError('Relative find region offsets must be integers')
+    if not width_ok or not height_ok:
+        raise ValueError('Relative find region width and height must be positive integers')
+
+    left = anchor_x + x_offset
+    top = anchor_y + y_offset
+    return (left, top, left + width, top + height), True
+
+
 def _handle_find(
         act, p, ctx: RunContext, in_loop, retry_count=0, retry_interval=0.0):
     _raise_if_stop_requested(ctx, "Stop requested before find")
     is_img = 'IMAGE' in act
     sig = _build_find_signature(act, p, ctx)
 
-    is_manual_region = False
-    if p.get('region') is not None:
-        region_bbox = screen_locator.coerce_bbox(p.get('region'))
-        if region_bbox is None:
-            raise ValueError(f"Manual find region is invalid: {p.get('region')}")
-        is_manual_region = True
-    else:
+    region_bbox, is_constrained_region = _resolve_find_region(p, ctx)
+    uses_legacy_cache = p.get('region_mode') is None and p.get('region') is None
+    if uses_legacy_cache:
         cache_bbox = ctx.locator.get_runtime_box(sig, p.get('cache_box'))
         region_bbox = screen_locator.expand_bbox(cache_bbox, CACHE_BOX_PADDING)
 
@@ -1573,7 +1806,7 @@ def _handle_find(
             and ctx.get_option('enable_global_fallback', True)
             and enhanced_mode
             and not act.startswith('IF_')
-            and not is_manual_region
+            and not is_constrained_region
     ):
         fallback_request = _build_find_locate_request(
             act, p, ctx, None, None, ocr_cache_key
@@ -1602,6 +1835,7 @@ def _handle_find(
         pos = (res[0], res[1])
         if in_loop:
             ctx.locator.remember_position(sig, pos)
+        ctx.set_last_locate_pos(pos)
         ctx.set_last_pos(pos)
         if act in ('FIND_TEXT', 'IF_TEXT_FOUND') and len(res) >= 3:
             save_var = p.get('save_to_var', '').strip()
@@ -1906,6 +2140,7 @@ def _locate_for_loop_condition(loop_data, ctx: RunContext):
         ) from exc
 
     if result.found:
+        ctx.set_last_locate_pos(result.position)
         if mode == 'until_image':
             logger.info(
                 "  OK found target image: %s",
@@ -2176,7 +2411,7 @@ def _handle_run(p, ctx: RunContext):
 # ======================================================================
 # Macro data validation
 # ======================================================================
-_IF_OPEN_ACTIONS = frozenset({'IF_IMAGE_FOUND', 'IF_TEXT_FOUND', 'IF_VAR'})
+_IF_OPEN_ACTIONS = frozenset({'IF_IMAGE_FOUND', 'IF_TEXT_FOUND', 'IF_COLOR_MATCH', 'IF_VAR'})
 _CONTROL_CLOSE_TO_OPEN = {
     'END_IF': _IF_OPEN_ACTIONS,
     'END_LOOP': frozenset({'LOOP_START'}),

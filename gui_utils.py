@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # gui_utils.py
 # 功能说明：GUI 组件与参数表单工具，负责控件构建、输入校验和设置对话框
-# 版本：1.8.5
+# 版本：1.8.6
 
 import sys
 import tkinter as tk
@@ -40,14 +40,41 @@ LOOP_MODE_OPTIONS = {
 }
 LOOP_MODE_DISPLAY_BY_VALUE = {v: k for k, v in LOOP_MODE_OPTIONS.items()}
 
+FIND_REGION_MODE_OPTIONS = {
+    '全屏': 'full',
+    '固定区域': 'absolute',
+    '相对上次识别位置': 'relative',
+}
+FIND_REGION_MODE_DISPLAY_BY_VALUE = {
+    value: name for name, value in FIND_REGION_MODE_OPTIONS.items()
+}
+_FIND_REGION_PARAM_KEYS = (
+    'region', 'region_x_offset', 'region_y_offset',
+    'region_width', 'region_height',
+)
+_FIND_REGION_VISIBLE_PARAMS = {
+    'full': (),
+    'absolute': ('region',),
+    'relative': (
+        'region_x_offset', 'region_y_offset',
+        'region_width', 'region_height',
+    ),
+}
+
+COLOR_COMPARISON_OPTIONS = {
+    '匹配': 'match',
+    '不匹配': 'not_match',
+}
+COLOR_COMPARISON_DISPLAY_BY_VALUE = {v: k for k, v in COLOR_COMPARISON_OPTIONS.items()}
+
 _LOOP_PARAM_KEYS = ('times', 'condition_image', 'confidence', 'condition_text', 'lang', 'max_iterations', 'region')
 _LOOP_VISIBLE_PARAMS = {
     'fixed': ('times',),
     'until_image': ('condition_image', 'confidence', 'max_iterations', 'region'),
     'until_text': ('condition_text', 'lang', 'max_iterations', 'region'),
 }
-_RUN_COMMAND_PARAMS = ('command', 'args', 'timeout', 'cwd', 'save_output', 'shell_mode', 'fail_stop')
-_RUN_SCRIPT_PARAMS = ('script_path', 'interpreter', 'args', 'timeout', 'cwd', 'save_output', 'fail_stop')
+_RUN_COMMAND_PARAMS = ('command', 'args', 'timeout_ms', 'cwd', 'save_output', 'shell_mode', 'fail_stop')
+_RUN_SCRIPT_PARAMS = ('script_path', 'interpreter', 'args', 'timeout_ms', 'cwd', 'save_output', 'fail_stop')
 _RUN_VISIBLE_PARAMS = {
     'command': _RUN_COMMAND_PARAMS,
     'script': _RUN_SCRIPT_PARAMS,
@@ -55,7 +82,10 @@ _RUN_VISIBLE_PARAMS = {
 _RUN_PARAM_KEYS = tuple(sorted(set(_RUN_COMMAND_PARAMS + _RUN_SCRIPT_PARAMS)))
 
 _OPTIONAL_PARAM_KEYS = {
-    '*': {'region', 'extract_pattern', 'save_to_var'},
+    '*': {
+        'region', 'extract_pattern', 'save_to_var',
+        'region_x_offset', 'region_y_offset', 'region_width', 'region_height',
+    },
     'SET_VAR': {'var_value'},
     'WRITE_FILE': {'content', 'append'},
     'PROMPT_INPUT': {'default_value'},
@@ -63,15 +93,15 @@ _OPTIONAL_PARAM_KEYS = {
     'IF_VAR': {'var_value', 'expected_val'},
     'GOTO_IF': {'var_value', 'expected_val'},
     'SCROLL': {'x', 'y'},
-    'CLICK': {'x', 'y', 'clicks', 'interval', 'duration'},
+    'CLICK': {'x', 'y', 'clicks', 'interval_ms', 'duration_ms'},
 }
 _EMPTY_SKIP_ACTIONS = {'ELSE', 'END_IF', 'END_LOOP', 'END_FOREACH', 'NOTE', 'RUN'}
-_NUMERIC_PARAM_KEYS = {'x', 'y', 'ms', 'times', 'x_offset', 'y_offset', 'amount', 'max_iterations', 'max_jumps', 'max_lines', 'retry_count', 'timeout', 'clicks', 'interval', 'duration'}
-_NON_NEGATIVE_INT_PARAM_KEYS = {'ms', 'times', 'max_iterations', 'max_jumps', 'max_lines', 'retry_count', 'clicks'}
+_NUMERIC_PARAM_KEYS = {'x', 'y', 'start_x', 'start_y', 'end_x', 'end_y', 'ms', 'duration_ms', 'interval_ms', 'retry_interval_ms', 'timeout_ms', 'times', 'x_offset', 'y_offset', 'amount', 'max_iterations', 'max_jumps', 'max_lines', 'retry_count', 'timeout', 'clicks', 'interval', 'duration', 'retry_interval', 'tolerance', 'region_x_offset', 'region_y_offset', 'region_width', 'region_height'}
+_NON_NEGATIVE_INT_PARAM_KEYS = {'ms', 'duration_ms', 'interval_ms', 'retry_interval_ms', 'timeout_ms', 'times', 'max_iterations', 'max_jumps', 'max_lines', 'retry_count', 'clicks', 'tolerance', 'region_width', 'region_height'}
 _NON_NEGATIVE_FLOAT_PARAM_KEYS = {'interval', 'duration'}
-_POSITIVE_INT_PARAM_KEYS = {'ms', 'times', 'clicks', 'max_iterations', 'max_jumps', 'max_lines'}
+_POSITIVE_INT_PARAM_KEYS = {'ms', 'timeout_ms', 'times', 'clicks', 'max_iterations', 'max_jumps', 'max_lines', 'region_width', 'region_height'}
 _RUN_DEFAULT_OMIT_PARAMS = {
-    'timeout': '30',
+    'timeout_ms': '30000',
     'interpreter': 'python',
     'encoding': 'utf-8',
 }
@@ -85,16 +115,32 @@ _LOOP_REQUIRED_PARAMS = {
 
 _SIMPLE_ACTION_FORM_FIELDS = {
     'MOVE_OFFSET': (
-        ('entry', 'x_offset', 'X 偏移:', '10', None),
-        ('entry', 'y_offset', 'Y 偏移:', '0', None),
+        ('entry', 'x_offset', 'X 偏移（正数向右，负数向左）:', '10', None),
+        ('entry', 'y_offset', 'Y 偏移（正数向下，负数向上）:', '0', None),
+        ('entry', 'duration_ms', '移动耗时（毫秒）:', '250', None),
     ),
     'CLICK': (
         ('combobox', 'button', '按键:', None, lambda: list(MacroSchema.CLICK_OPTIONS.keys())),
         ('entry', 'x', 'X 坐标 (可选, 留空=当前位置):', '', None),
         ('entry', 'y', 'Y 坐标 (可选, 留空=当前位置):', '', None),
         ('entry', 'clicks', '点击次数 (可选, 默认1):', '', None),
-        ('entry', 'interval', '点击间隔毫秒 (可选, 默认0):', '', None),
-        ('entry', 'duration', '按下持续秒 (可选, 默认0):', '', None),
+        ('entry', 'interval_ms', '点击间隔（毫秒，可选，默认 0）:', '', None),
+        ('entry', 'duration_ms', '移动耗时（毫秒，可选，默认 0）:', '', None),
+    ),
+    'DRAG_TO': (
+        ('entry', 'start_x', '起点 X:', '100', None),
+        ('entry', 'start_y', '起点 Y:', '100', None),
+        ('entry', 'end_x', '终点 X:', '300', None),
+        ('entry', 'end_y', '终点 Y:', '300', None),
+        ('combobox', 'button', '按键:', None, lambda: list(MacroSchema.CLICK_OPTIONS.keys())),
+        ('entry', 'duration_ms', '拖动持续时长（毫秒）:', '500', None),
+    ),
+    'IF_COLOR_MATCH': (
+        ('entry', 'x', 'X 坐标:', '100', None),
+        ('entry', 'y', 'Y 坐标:', '100', None),
+        ('entry', 'target_color', '目标颜色 (#RRGGBB):', '#FFFFFF', None),
+        ('entry', 'tolerance', '颜色容差 (0-255):', '10', None),
+        ('combobox', 'comparison', '判断方式:', '匹配', lambda: list(COLOR_COMPARISON_OPTIONS.keys())),
     ),
     'SCROLL': (
         ('entry', 'amount', '滚动量 (正数=上, 负数=下):', '100', None),
@@ -106,6 +152,7 @@ _SIMPLE_ACTION_FORM_FIELDS = {
     ),
     'TYPE_TEXT': (
         ('entry', 'text', '输入文本:', '你好', None),
+        ('entry', 'interval_ms', '字符间隔（毫秒）:', '0', None),
     ),
     'ACTIVATE_WINDOW': (
         ('entry', 'title', '窗口标题 (支持部分匹配):', '记事本', None),
@@ -129,9 +176,12 @@ _SIMPLE_ACTION_FORM_FIELDS = {
 }
 
 _SIMPLE_ACTION_HINTS = {
-    'CLICK': '* 将鼠标移到目标位置后按 F8，可自动填写 X/Y；留空则在运行时当前位置点击。\n* clicks/interval/duration 留空则使用默认值（1次/0毫秒/0秒）。',
+    'MOVE_OFFSET': '* 以执行该步骤时的鼠标当前位置为起点，偏移量单位为像素。\n* 示例：X = 100、Y = -50，表示向右移动 100 像素、向上移动 50 像素。',
+    'CLICK': '* 将鼠标移到目标位置后按 F8，可自动填写 X/Y；留空则在运行时当前位置点击。\n* 点击次数、间隔和移动耗时留空时使用默认值（1 次 / 0 毫秒 / 0 毫秒）。',
+    'DRAG_TO': '* 按 F8 依次记录拖动起点和终点；再次按 F8 会从起点重新记录。\n* 宏停止或发生异常时会强制释放鼠标键。',
+    'IF_COLOR_MATCH': '* 将鼠标移到目标像素后按 F8，可同时填写 X/Y 和当前颜色。\n* 容差表示 RGB 每个通道允许的最大误差。',
     'SCROLL': '* 提示: 如果 X, Y 为空，将在当前鼠标位置滚动。',
-    'TYPE_TEXT': "* 此功能使用剪贴板 (Ctrl+V)，以支持中文及复杂文本输入。\n* 支持占位符: {CLIPBOARD} 将替换为剪贴板内容\n* 示例: '订单号: {CLIPBOARD}' → '订单号: 12345'",
+    'TYPE_TEXT': "* 字符间隔为 0 时使用剪贴板 (Ctrl+V)，以支持中文及复杂文本输入。\n* 大于 0 时逐字符输入，适合需要模拟键入间隔的英文文本。\n* 支持占位符: {CLIPBOARD} 将替换为剪贴板内容\n* 示例: '订单号: {CLIPBOARD}' → '订单号: 12345'",
     'ACTIVATE_WINDOW': '* 提示: 宏将查找标题中包含此文本的窗口，并将其激活到最前端。',
     'NOTE': '* 注意: 此步骤仅作为注释，不会执行任何操作。\n* 备注内容以 LABEL: 或 标签: 开头时，可作为“跳转到标签”的目标。\n* 示例: LABEL: 重试登录',
     'SET_VAR': '* 提示: 变量名无需大括号，变量值支持 {其他变量} 插值。',
@@ -242,6 +292,12 @@ def _validate_retry_interval(value):
 
 
 def _convert_param_value(key, value, engine_key_map=None):
+    if key == 'region_mode':
+        if value in FIND_REGION_MODE_OPTIONS:
+            return FIND_REGION_MODE_OPTIONS[value], None, True
+        if value in FIND_REGION_MODE_DISPLAY_BY_VALUE:
+            return value, None, True
+        return None, "参数 'region_mode' 必须选择全屏、固定区域或相对上次识别位置", False
     if key == 'mode':
         return LOOP_MODE_OPTIONS.get(value, 'fixed'), None, True
     if key == 'run_type':
@@ -250,6 +306,12 @@ def _convert_param_value(key, value, engine_key_map=None):
         return MacroSchema.LANG_OPTIONS.get(value, 'eng'), None, True
     if key == 'button':
         return MacroSchema.CLICK_OPTIONS.get(value, 'left'), None, True
+    if key == 'comparison':
+        if value in COLOR_COMPARISON_OPTIONS:
+            return COLOR_COMPARISON_OPTIONS[value], None, True
+        if value in COLOR_COMPARISON_DISPLAY_BY_VALUE:
+            return value, None, True
+        return None, "参数 'comparison' 必须选择匹配或不匹配", False
     if key == 'engine':
         if engine_key_map:
             return engine_key_map.get(value, 'auto'), None, True
@@ -320,6 +382,47 @@ def _sanitize_foreach_line_params(params):
     params['index_var'] = str(params.get('index_var', 'loop_index')).strip() or 'loop_index'
     params['total_var'] = str(params.get('total_var', 'loop_total')).strip() or 'loop_total'
     return params, None
+
+
+def _sanitize_color_condition_params(params):
+    target_color = str(params.get('target_color', '')).strip()
+    if re.fullmatch(r'#[0-9a-fA-F]{6}', target_color) is None:
+        return None, "参数 'target_color' 必须使用 #RRGGBB 格式"
+    try:
+        tolerance = int(str(params.get('tolerance', '')).strip())
+    except (TypeError, ValueError, OverflowError):
+        return None, "参数 'tolerance' 必须是 0 到 255 的整数"
+    if not 0 <= tolerance <= 255:
+        return None, "参数 'tolerance' 必须是 0 到 255 的整数"
+    params['target_color'] = target_color.upper()
+    return params, None
+
+
+def _sanitize_find_params(params):
+    mode = params.get('region_mode')
+    if mode is None:
+        return params, None
+
+    if mode == 'full':
+        for key in ('region',) + _FIND_REGION_PARAM_KEYS[1:]:
+            params.pop(key, None)
+        return params, None
+
+    if mode == 'absolute':
+        if 'region' not in params:
+            return None, "固定区域模式必须选择或填写搜索范围"
+        for key in _FIND_REGION_PARAM_KEYS[1:]:
+            params.pop(key, None)
+        return params, None
+
+    if mode == 'relative':
+        params.pop('region', None)
+        for key in _FIND_REGION_PARAM_KEYS[1:]:
+            if key not in params:
+                return None, f"相对区域模式的参数 '{key}' 不能为空"
+        return params, None
+
+    return None, f"不支持的搜索范围模式: {mode}"
 
 
 def _validate_image_params(params):
@@ -490,9 +593,10 @@ class ParamWidgetFactory:
         ttk.Label(frame, text=label_text, font=self.font_ui).pack(anchor="w")
         input_frame = ttk.Frame(frame)
         input_frame.pack(fill=tk.X, expand=True)
-        entry = ttk.Entry(input_frame, width=25, font=self.font_ui)
+        input_frame.columnconfigure(0, weight=1)
+        entry = ttk.Entry(input_frame, width=18, font=self.font_ui)
         entry.insert(0, default_value)
-        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        entry.grid(row=0, column=0, sticky="ew")
 
         def browse():
             types = filetypes or [("All", "*.*")]
@@ -502,11 +606,12 @@ class ParamWidgetFactory:
                 selected = filedialog.askopenfilename(filetypes=types)
             if selected:
                 entry.delete(0, tk.END)
-                entry.insert(0, selected)
+                entry.insert(0, os.path.normpath(selected))
 
         btn = ttk.Button(input_frame, text="浏览...", width=8, command=browse, bootstyle="info-outline")
-        btn.pack(side=tk.RIGHT, padx=(5, 0))
+        btn.grid(row=0, column=1, sticky="e", padx=(5, 0))
         entry._param_frame = frame
+        entry._browse_button = btn
         frame.pack(fill=tk.X, pady=8)
         return entry
 
@@ -632,6 +737,7 @@ class ParamWidgetFactory:
         preview_btn.pack(side=tk.RIGHT, padx=(4, 0))
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+        entry._param_frame = frame
         frame.pack(fill=tk.X, pady=8)
         return entry  # 返回 Entry 控件
 
@@ -702,7 +808,7 @@ class ParamWidgetFactory:
 
     def _add_find_retry_options(self, parent_frame, param_widgets, include_ignore_fail=False):
         param_widgets['retry_count'] = self.create_param_entry(parent_frame, "retry_count", "失败重试次数:", "0")
-        param_widgets['retry_interval'] = self.create_param_entry(parent_frame, "retry_interval", "重试间隔(秒):", "0.5")
+        param_widgets['retry_interval_ms'] = self.create_param_entry(parent_frame, "retry_interval_ms", "重试间隔（毫秒）:", "500")
         if include_ignore_fail:
             param_widgets['ignore_fail'] = self.create_param_checkbox(parent_frame, "ignore_fail", "[OK] 找不到时继续执行", default=False)
 
@@ -739,12 +845,58 @@ class ParamWidgetFactory:
         self._trace_add_for_widget(save_to_var_value, 'write', lambda *_: toggle())
         toggle()
 
+    def _add_find_region_options(
+            self, parent_frame, param_widgets, on_select_region,
+            on_preview_region=None):
+        scope_frame = ttk.Labelframe(parent_frame, text="搜索范围", padding=(8, 6))
+        scope_frame.pack(fill=tk.X, pady=8)
+        default_mode = FIND_REGION_MODE_DISPLAY_BY_VALUE['full']
+        param_widgets['region_mode'] = self.create_param_combobox(
+            scope_frame,
+            'region_mode',
+            '范围模式:',
+            list(FIND_REGION_MODE_OPTIONS.keys()),
+            default=default_mode,
+        )
+        AutoWrapLabel(
+            scope_frame,
+            text='相对模式以上一次成功找图/OCR结果的中心为原点；X 向右为正，Y 向下为正。',
+            font=self.font_ui,
+            style='secondary.TLabel',
+        ).pack(anchor='w', fill=tk.X, pady=(0, 4))
+        param_widgets['region'] = self.create_region_selector(
+            scope_frame, '', on_select_region, on_preview_region
+        )
+        param_widgets['region_x_offset'] = self.create_compact_entry(
+            scope_frame, 'region_x_offset', 'X 偏移:', '0'
+        )
+        param_widgets['region_y_offset'] = self.create_compact_entry(
+            scope_frame, 'region_y_offset', 'Y 偏移:', '0'
+        )
+        param_widgets['region_width'] = self.create_compact_entry(
+            scope_frame, 'region_width', '区域宽度:', '200'
+        )
+        param_widgets['region_height'] = self.create_compact_entry(
+            scope_frame, 'region_height', '区域高度:', '80'
+        )
+        param_widgets['region_mode'].bind(
+            '<<ComboboxSelected>>',
+            lambda _event: update_find_region_params(
+                param_widgets, scope_frame, param_widgets['region_mode']
+            ),
+        )
+        update_find_region_params(
+            param_widgets, scope_frame, param_widgets['region_mode']
+        )
+
 
     def _build_image_find_form(self, action_key, parent_frame, param_widgets, on_select_region,
                                browse_image_cb, on_test_find_image, on_preview_region=None):
         is_if_action = action_key == 'IF_IMAGE_FOUND'
         param_widgets['path'] = self.create_param_entry(parent_frame, "path", "图像路径:", "button.png")
-        param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region, on_preview_region)
+        self._add_find_region_options(
+            parent_frame, param_widgets, on_select_region, on_preview_region
+        )
         confidence_label = "置信度:" if is_if_action else "置信度(0.1-1.0):"
         param_widgets['confidence'] = self.create_param_entry(parent_frame, "confidence", confidence_label, "0.8")
         self._add_find_retry_options(parent_frame, param_widgets, include_ignore_fail=not is_if_action)
@@ -759,7 +911,9 @@ class ParamWidgetFactory:
         is_if_action = action_key == 'IF_TEXT_FOUND'
         label_text = "查找文本:" if is_if_action else "查找的文本:"
         param_widgets['text'] = self.create_param_entry(parent_frame, "text", label_text, "确定")
-        param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region, on_preview_region)
+        self._add_find_region_options(
+            parent_frame, param_widgets, on_select_region, on_preview_region
+        )
         param_widgets['lang'] = self.create_param_combobox(parent_frame, "lang", "语言:", list(MacroSchema.LANG_OPTIONS.keys()))
         param_widgets['engine'] = self.create_ocr_engine_combobox(parent_frame, available_ocr_keys)
         self._add_find_retry_options(parent_frame, param_widgets, include_ignore_fail=not is_if_action)
@@ -821,6 +975,7 @@ class ParamWidgetFactory:
     def _build_ai_command_form(self, parent_frame, param_widgets, on_select_region, on_test_ai_command, on_preview_region=None):
         param_widgets['instruction'] = self.create_param_text(parent_frame, "instruction", "AI 指令:", "点击列表里价格最低的那个商品", height=3)
         param_widgets['region'] = self.create_region_selector(parent_frame, "", on_select_region, on_preview_region)
+        param_widgets['duration_ms'] = self.create_param_entry(parent_frame, "duration_ms", "移动耗时（毫秒）:", "250")
         self.create_hint_label(parent_frame, "* 提示: 输入自然语言指令，如 '点击确定按钮'\n* AI 会分析屏幕截图，理解指令并返回坐标\n* 支持: OpenAI, Anthropic, DeepSeek, 智谱, 通义千问等")
         self.create_test_button(parent_frame, "🧪 测试 AI 指令", on_test_ai_command)
 
@@ -831,7 +986,7 @@ class ParamWidgetFactory:
         param_widgets['args'] = self.create_param_text(parent_frame, "args", "参数:", "", height=3)
         param_widgets['script_path'] = self.create_file_path_entry(parent_frame, "script_path", "脚本路径:", "process.py", filetypes=[("Scripts", "*.py *.js *.ps1"), ("All", "*.*")])
         param_widgets['interpreter'] = self.create_param_combobox(parent_frame, "interpreter", "解释器:", ["python", "node", "powershell"], default="python")
-        param_widgets['timeout'] = self.create_param_entry(parent_frame, "timeout", "超时(秒):", "30")
+        param_widgets['timeout_ms'] = self.create_param_entry(parent_frame, "timeout_ms", "超时（毫秒）:", "30000")
         param_widgets['cwd'] = self.create_param_entry(parent_frame, "cwd", "工作目录:", "")
         param_widgets['save_output'] = self.create_param_checkbox(parent_frame, "save_output", "[OK] 保存输出到剪贴板", default=False)
         param_widgets['shell_mode'] = self.create_param_checkbox(parent_frame, "shell_mode", "[警告] shell 模式 (仅可信宏)", default=False)
@@ -843,6 +998,7 @@ class ParamWidgetFactory:
     def _build_move_to_form(self, parent_frame, param_widgets, mouse_tracker, mouse_pos_var):
         param_widgets['x'] = self.create_param_entry(parent_frame, "x", "X 坐标:", "100")
         param_widgets['y'] = self.create_param_entry(parent_frame, "y", "Y 坐标:", "100")
+        param_widgets['duration_ms'] = self.create_param_entry(parent_frame, "duration_ms", "移动耗时（毫秒）:", "250")
         ttk.Separator(parent_frame, orient='horizontal').pack(fill='x', pady=(15, 5))
         ttk.Label(parent_frame, text="当前鼠标位置 (参考):", font=self.font_ui, foreground='gray').pack(anchor="w", pady=(5, 0))
         if mouse_pos_var is not None:
@@ -904,7 +1060,13 @@ class ParamWidgetFactory:
         param_widgets['strip_fields'] = self.create_param_checkbox(advanced_frame, "strip_fields", "[OK] 去掉字段前后空格", default=True)
 
     def _build_write_file_form(self, parent_frame, param_widgets):
-        param_widgets['file_path'] = self.create_file_path_entry(parent_frame, "file_path", "文本文件路径:", "C:\\log.txt", mode="save", filetypes=[("Text", "*.txt *.log *.csv *.json *.jsonl *.md *.xml *.yaml *.yml *.ini *.cfg"), ("All", "*.*")])
+        param_widgets['file_path'] = self.create_file_path_entry(parent_frame, "file_path", "文本文件路径:", "log.txt", mode="save", filetypes=[("Text", "*.txt *.log *.csv *.json *.jsonl *.md *.xml *.yaml *.yml *.ini *.cfg"), ("All", "*.*")])
+        self.create_hint_label(
+            parent_frame,
+            "* 安全限制：只能写入宏文件所在目录、程序所在目录、当前工作目录或系统临时目录及其子目录。\n"
+            "* 文件即使已经存在，也不会绕过目录限制；其他绝对路径会在运行时被拒绝。\n"
+            "* 建议使用相对路径（如 seatinfo.ini）；已保存宏以宏文件所在目录为基准，未保存宏以当前工作目录为基准。",
+        )
         param_widgets['content'] = self.create_param_text(parent_frame, "content", "写入文本:", "{date} - {result}", height=4)
         param_widgets['encoding'] = self.create_param_combobox(parent_frame, "encoding", "编码:", ["utf-8", "gbk", "gb2312"], default="utf-8")
         param_widgets['append'] = self.create_param_checkbox(parent_frame, "append", "[OK] 追加模式 (不覆盖原文本文件)", default=True)
@@ -1018,7 +1180,23 @@ class ParamWidgetFactory:
 
     def _collect_widget_params(self, action_key, param_widgets, engine_key_map):
         params = {}
+        inactive_region_params = set()
+        if action_key in (
+                'FIND_IMAGE', 'IF_IMAGE_FOUND', 'FIND_TEXT', 'IF_TEXT_FOUND'):
+            mode_widget = param_widgets.get('region_mode')
+            if mode_widget is not None:
+                display_mode = mode_widget.get()
+                mode = FIND_REGION_MODE_OPTIONS.get(display_mode, display_mode)
+                active_region_params = set(
+                    _FIND_REGION_VISIBLE_PARAMS.get(mode, ())
+                )
+                inactive_region_params = (
+                    set(_FIND_REGION_PARAM_KEYS) - active_region_params
+                )
+
         for k, w in param_widgets.items():
+            if k in inactive_region_params:
+                continue
             if isinstance(w, tk.BooleanVar):
                 params[k] = w.get()
                 continue
@@ -1062,6 +1240,11 @@ class ParamWidgetFactory:
             'GOTO_LABEL': _sanitize_goto_label_params,
             'LOOP_START': _sanitize_loop_start_params,
             'FOREACH_LINE': _sanitize_foreach_line_params,
+            'IF_COLOR_MATCH': _sanitize_color_condition_params,
+            'FIND_IMAGE': _sanitize_find_params,
+            'IF_IMAGE_FOUND': _sanitize_find_params,
+            'FIND_TEXT': _sanitize_find_params,
+            'IF_TEXT_FOUND': _sanitize_find_params,
         }.get(action_key)
         if sanitizer is not None:
             params, error = sanitizer(params)
@@ -1101,6 +1284,21 @@ def update_loop_params(param_widgets, param_frame, mode_widget):
         param_frame,
         _LOOP_PARAM_KEYS,
         _LOOP_VISIBLE_PARAMS.get(mode, ()),
+    )
+
+
+def update_find_region_params(param_widgets, param_frame, mode_widget):
+    """Show only the fields used by the selected find-region mode."""
+    if 'region_mode' not in param_widgets or mode_widget is None:
+        return
+
+    display_value = mode_widget.get()
+    mode = FIND_REGION_MODE_OPTIONS.get(display_value, display_value)
+    _set_param_visibility(
+        param_widgets,
+        param_frame,
+        _FIND_REGION_PARAM_KEYS,
+        _FIND_REGION_VISIBLE_PARAMS.get(mode, ()),
     )
 
 def _get_widget_frame(widget):
@@ -1451,4 +1649,3 @@ def get_icon_path(icon_name="app_icon.ico", app_version="1.8.0"):
     except Exception as e:
         logger.error(f"提取图标失败: {e}")
         return None
-

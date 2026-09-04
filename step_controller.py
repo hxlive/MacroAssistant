@@ -2,7 +2,7 @@
 # step_controller.py
 # 功能说明：宏步骤控制器，负责步骤数据、列表展示、参数编辑及手工定位测试
 """统一管理宏步骤状态、步骤配置界面及相关交互逻辑。"""
-# Version: 1.8.5
+# Version: 1.8.6
 
 from __future__ import annotations
 
@@ -19,7 +19,14 @@ from core_engine import MacroSchema
 from sys_utils import HotkeyUtils, ImageTooltipManager, RegionPreviewOverlay, RegionSelector
 import gui_utils
 import screen_locator
-from gui_utils import param_internal_to_display, update_loop_params, update_run_params
+from gui_utils import (
+    FIND_REGION_MODE_DISPLAY_BY_VALUE,
+    FIND_REGION_MODE_OPTIONS,
+    param_internal_to_display,
+    update_find_region_params,
+    update_loop_params,
+    update_run_params,
+)
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -261,6 +268,7 @@ class StepController:
         self.steps: list[dict[str, Any]] = []
         self.editing_index: int | None = None
         self.last_test_location: tuple[int, int] | None = None
+        self.last_test_locate_anchor: tuple[int, int] | None = None
         self.editing_step_has_cache_box = False
         self.available_ocr_keys = list(self.ocr_engine_mapping)
 
@@ -327,7 +335,7 @@ class StepController:
 
     def _format_step_params(self, step, act):
         # 参数预览文本
-        display_params = step['params'].copy()
+        display_params = self._params_for_edit(act, step['params'])
 
         cache_str = ""
         if 'region' in display_params or 'cache_box' in display_params:
@@ -597,6 +605,23 @@ class StepController:
             run_type_widget.set(display_run_type)
             update_run_params(self.param_widgets, self.param_frame, run_type_widget)
 
+    def _apply_find_region_mode_for_edit(self, params):
+        mode_widget = self.param_widgets.get('region_mode')
+        if mode_widget is None:
+            return
+        saved_mode = params.get('region_mode')
+        if saved_mode is None:
+            saved_mode = (
+                'absolute'
+                if params.get('region') is not None or params.get('cache_box') is not None
+                else 'full'
+            )
+        display_mode = FIND_REGION_MODE_DISPLAY_BY_VALUE.get(saved_mode, saved_mode)
+        mode_widget.set(display_mode)
+        update_find_region_params(
+            self.param_widgets, self.param_frame, mode_widget
+        )
+
     def _prepare_action_form_for_edit(self, step):
         self.action_type.set(MacroSchema.ACTION_TRANSLATIONS.get(step['action']))
         self.update_param_fields(None)
@@ -606,6 +631,9 @@ class StepController:
             self._apply_loop_mode_for_edit(step['params'])
         elif step['action'] == 'RUN':
             self._apply_run_type_for_edit(step['params'])
+        elif step['action'] in (
+                'FIND_IMAGE', 'IF_IMAGE_FOUND', 'FIND_TEXT', 'IF_TEXT_FOUND'):
+            self._apply_find_region_mode_for_edit(step['params'])
 
     def _fill_region_param_for_edit(self, params):
         if 'region' not in self.param_widgets:
@@ -619,6 +647,8 @@ class StepController:
             )
 
     def _display_value_for_param(self, key, value):
+        if key == 'comparison':
+            return gui_utils.COLOR_COMPARISON_DISPLAY_BY_VALUE.get(value, value)
         if key not in ('lang', 'button', 'engine'):
             return value
         return param_internal_to_display(
@@ -631,11 +661,44 @@ class StepController:
 
     def _fill_regular_params_for_edit(self, params):
         for key, value in params.items():
-            if key in ('mode', 'run_type', 'cache_box', 'region'):
+            if key in ('mode', 'run_type', 'region_mode', 'cache_box', 'region'):
                 continue
             if key not in self.param_widgets:
                 continue
             self._set_param_widget_value(key, self._display_value_for_param(key, value))
+
+    @staticmethod
+    def _params_for_edit(action, params):
+        """Return form values with legacy action times converted to milliseconds."""
+        converted = copy.deepcopy(params)
+        specs = {
+            'CLICK': {
+                'interval_ms': ('interval', 1),
+                'duration_ms': ('duration', 1000),
+            },
+            'MOVE_TO': {'duration_ms': ('duration', 1000)},
+            'MOVE_OFFSET': {'duration_ms': ('duration', 1000)},
+            'TYPE_TEXT': {'interval_ms': ('interval', 1000)},
+            'AI_COMMAND': {'duration_ms': ('duration', 1000)},
+            'FIND_IMAGE': {'retry_interval_ms': ('retry_interval', 1000)},
+            'IF_IMAGE_FOUND': {'retry_interval_ms': ('retry_interval', 1000)},
+            'FIND_TEXT': {'retry_interval_ms': ('retry_interval', 1000)},
+            'IF_TEXT_FOUND': {'retry_interval_ms': ('retry_interval', 1000)},
+            'RUN': {'timeout_ms': ('timeout', 1000)},
+        }
+        for new_key, (legacy_key, multiplier) in specs.get(action, {}).items():
+            if new_key in converted:
+                converted.pop(legacy_key, None)
+                continue
+            if legacy_key not in converted:
+                continue
+            try:
+                value = float(converted[legacy_key]) * multiplier
+            except (TypeError, ValueError, OverflowError):
+                continue
+            converted[new_key] = int(value) if value.is_integer() else value
+            converted.pop(legacy_key, None)
+        return converted
 
     def _enter_edit_mode(self, index):
         self.editing_index = index
@@ -653,7 +716,9 @@ class StepController:
         step = self.steps[idx]
         self._prepare_action_form_for_edit(step)
         self._fill_region_param_for_edit(step['params'])
-        self._fill_regular_params_for_edit(step['params'])
+        self._fill_regular_params_for_edit(
+            self._params_for_edit(step['action'], step['params'])
+        )
         self._enter_edit_mode(idx)
 
     def cancel_edit_mode(self):
@@ -705,6 +770,31 @@ class StepController:
             messagebox.showerror('错误', f'选区失败: {exc}')
 
     def _read_test_region_box(self):
+        mode_widget = self.param_widgets.get('region_mode')
+        if mode_widget is not None:
+            display_mode = mode_widget.get()
+            mode = FIND_REGION_MODE_OPTIONS.get(display_mode, display_mode)
+            if mode == 'full':
+                return None
+            if mode == 'relative':
+                if self.last_test_locate_anchor is None:
+                    raise ValueError('相对搜索范围没有参考点，请先测试一次锚点识别步骤')
+                try:
+                    x_offset = int(self.param_widgets['region_x_offset'].get())
+                    y_offset = int(self.param_widgets['region_y_offset'].get())
+                    width = int(self.param_widgets['region_width'].get())
+                    height = int(self.param_widgets['region_height'].get())
+                except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError('相对搜索范围的偏移、宽度和高度必须是整数') from exc
+                if width <= 0 or height <= 0:
+                    raise ValueError('相对搜索范围的宽度和高度必须大于 0')
+                anchor_x, anchor_y = self.last_test_locate_anchor
+                left = anchor_x + x_offset
+                top = anchor_y + y_offset
+                return (left, top, left + width, top + height)
+            if mode != 'absolute':
+                raise ValueError(f'不支持的搜索范围模式: {display_mode}')
+
         region_widget = self.param_widgets.get('region')
         if region_widget is None:
             return None
@@ -824,6 +914,8 @@ class StepController:
         try:
             if result.found:
                 self.last_test_location = result.position
+                if result.source in ('image', 'ocr'):
+                    self.last_test_locate_anchor = result.position
                 pyautogui.moveTo(*result.position)
                 if result.source == 'vlm':
                     messagebox.showinfo(
@@ -909,7 +1001,7 @@ class StepController:
     def _start_coordinate_capture(self, action, *, show_conflict=True):
         """Route plain F8 samples into the active absolute-coordinate form."""
         self.stop_coordinate_capture()
-        if action not in {'MOVE_TO', 'CLICK'}:
+        if action not in {'MOVE_TO', 'CLICK', 'DRAG_TO', 'IF_COLOR_MATCH'}:
             return
 
         for purpose, configured in self.services.get_reserved_hotkeys().items():
@@ -924,12 +1016,19 @@ class StepController:
 
         self._coordinate_capture_generation += 1
         generation = self._coordinate_capture_generation
+        drag_target = 'start'
 
         def apply_coordinate(x, y):
+            nonlocal drag_target
             if generation != self._coordinate_capture_generation:
                 return
-            x_entry = self.param_widgets.get('x')
-            y_entry = self.param_widgets.get('y')
+            if action == 'DRAG_TO':
+                x_key = f'{drag_target}_x'
+                y_key = f'{drag_target}_y'
+            else:
+                x_key, y_key = 'x', 'y'
+            x_entry = self.param_widgets.get(x_key)
+            y_entry = self.param_widgets.get(y_key)
             if x_entry is None or y_entry is None:
                 return
             if not (
@@ -938,14 +1037,45 @@ class StepController:
                 return
             self._set_entry_text(x_entry, int(x))
             self._set_entry_text(y_entry, int(y))
-            self.services.set_status(
-                f"F8 已记录坐标: ({int(x)}, {int(y)})"
-            )
+            if action == 'DRAG_TO':
+                recorded_target = '起点' if drag_target == 'start' else '终点'
+                drag_target = 'end' if drag_target == 'start' else 'start'
+                next_target = '起点' if drag_target == 'start' else '终点'
+                self.services.set_status(
+                    f"F8 已记录拖动{recorded_target}: ({int(x)}, {int(y)})；下一次记录{next_target}"
+                )
+            elif action == 'IF_COLOR_MATCH':
+                try:
+                    red, green, blue = screen_locator.sample_screen_pixel(int(x), int(y))
+                    color_text = f'#{red:02X}{green:02X}{blue:02X}'
+                    color_entry = self.param_widgets.get('target_color')
+                    if color_entry is not None and self._coordinate_entry_is_alive(color_entry):
+                        self._set_entry_text(color_entry, color_text)
+                    self.services.set_status(
+                        f"F8 已记录坐标: ({int(x)}, {int(y)})，颜色: {color_text}"
+                    )
+                except Exception as exc:
+                    self.services.set_status(
+                        f"F8 已记录坐标: ({int(x)}, {int(y)})，但读取颜色失败: {exc}"
+                    )
+            else:
+                self.services.set_status(
+                    f"F8 已记录坐标: ({int(x)}, {int(y)})"
+                )
 
         self.services.set_coordinate_capture(apply_coordinate)
-        self.services.set_status(
-            "F8 坐标取点已启用：将鼠标移到目标位置后按 F8"
-        )
+        if action == 'DRAG_TO':
+            self.services.set_status(
+                "F8 拖动取点已启用：下一次记录起点"
+            )
+        elif action == 'IF_COLOR_MATCH':
+            self.services.set_status(
+                "F8 颜色取点已启用：将鼠标移到目标像素后按 F8"
+            )
+        else:
+            self.services.set_status(
+                "F8 坐标取点已启用：将鼠标移到目标位置后按 F8"
+            )
 
     def refresh_coordinate_capture(self):
         """Restore F8 capture for the current form after a temporary pause."""
@@ -961,6 +1091,7 @@ class StepController:
 
         if self.editing_step_has_cache_box and 'region' in params:
             params['cache_box'] = params.pop('region')
+            params.pop('region_mode', None)
 
 
         if action == 'PRESS_KEY':
@@ -974,6 +1105,8 @@ class StepController:
         if action not in ('FIND_TEXT', 'FIND_IMAGE', 'IF_TEXT_FOUND', 'IF_IMAGE_FOUND'):
             return
         if self.editing_index is not None or not self.last_test_location:
+            return
+        if 'region_mode' in step['params']:
             return
         if 'region' in step['params'] or 'cache_box' in step['params']:
             return
@@ -1126,12 +1259,14 @@ class StepController:
         replacement = copy.deepcopy(steps)
         self.steps = replacement
         self.last_test_location = None
+        self.last_test_locate_anchor = None
         self.editing_step_has_cache_box = False
         self.cancel_edit_mode()
 
     def clear_steps(self) -> None:
         self.steps = []
         self.last_test_location = None
+        self.last_test_locate_anchor = None
         self.editing_step_has_cache_box = False
         self.cancel_edit_mode()
 

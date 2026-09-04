@@ -1,16 +1,20 @@
 # -*- coding: utf-8 -*-
 # sys_utils.py
 # 功能说明：系统适配工具，负责 DPI、屏幕区域、全局热键及桌面辅助窗口
-# 版本: 1.8.5
+# 版本: 1.8.6
 
 import sys
 import os
+import json
 import threading
 import queue
+import tempfile
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 import pyautogui
 import ctypes
+from ctypes import wintypes
 from PIL import Image, ImageGrab, ImageTk
 from pynput import keyboard
 
@@ -20,6 +24,14 @@ logger = logging.getLogger(__name__)
 
 _SHARED_FILE_LOCKS = {}
 _SHARED_FILE_LOCKS_GUARD = threading.Lock()
+_WS_EX_TOOLWINDOW = 0x00000080
+_WS_EX_APPWINDOW = 0x00040000
+_PASSIVE_OVERLAY_STYLE_MASK = 0x00000020 | 0x00080000 | 0x08000000 | _WS_EX_TOOLWINDOW
+MINI_STATUS_WIDTH = 320
+_APP_CONFIG_KEYS = frozenset({
+    'recent_files', 'theme', 'hotkey_run', 'hotkey_stop', 'enhanced_mode',
+    'run_enabled', 'skip_confirm', 'dont_minimize', 'mini_status_position', 'vlm',
+})
 
 def _parse_hotkey_str(hotkey_str):
     """Parse a hotkey string without retaining manager instances in a cache."""
@@ -29,11 +41,159 @@ def _parse_hotkey_str(hotkey_str):
     return set(parts[:-1]), parts[-1]
 
 
+class _SharedFileLock:
+    """Re-entrant thread lock backed by an OS lock file for other app instances."""
+    def __init__(self, target_path, timeout=5.0):
+        self.target_path = os.path.abspath(os.fspath(target_path))
+        self.lock_path = self.target_path + '.lock'
+        self.timeout = float(timeout)
+        self._thread_lock = threading.RLock()
+        self._depth = 0
+        self._lock_stream = None
+
+    def _acquire_os_lock(self):
+        os.makedirs(os.path.dirname(self.lock_path) or '.', exist_ok=True)
+        stream = open(self.lock_path, 'a+b')
+        try:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b'\0')
+                stream.flush()
+            stream.seek(0)
+            if sys.platform == 'win32':
+                import msvcrt
+                deadline = time.monotonic() + self.timeout
+                while True:
+                    try:
+                        stream.seek(0)
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(f"timed out waiting for config lock: {self.target_path}")
+                        time.sleep(0.05)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        except BaseException:
+            stream.close()
+            raise
+        self._lock_stream = stream
+
+    def _release_os_lock(self):
+        stream = self._lock_stream
+        self._lock_stream = None
+        if stream is None:
+            return
+        try:
+            stream.seek(0)
+            if sys.platform == 'win32':
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            stream.close()
+
+    def __enter__(self):
+        self._thread_lock.acquire()
+        try:
+            if self._depth == 0:
+                self._acquire_os_lock()
+            self._depth += 1
+            return self
+        except BaseException:
+            self._thread_lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            self._depth -= 1
+            if self._depth == 0:
+                self._release_os_lock()
+        finally:
+            self._thread_lock.release()
+
+
 def get_shared_file_lock(path):
-    """Return the process-wide lock used for read-modify-write file transactions."""
+    """Return the cross-process lock used for read-modify-write transactions."""
     normalized = os.path.normcase(os.path.abspath(os.fspath(path)))
     with _SHARED_FILE_LOCKS_GUARD:
-        return _SHARED_FILE_LOCKS.setdefault(normalized, threading.RLock())
+        return _SHARED_FILE_LOCKS.setdefault(normalized, _SharedFileLock(normalized))
+
+
+def write_json_file_atomically(path, data):
+    """Write JSON through a unique sibling temp file and atomically replace path."""
+    path = os.path.abspath(os.fspath(path))
+    with get_shared_file_lock(path):
+        directory = os.path.dirname(path) or '.'
+        os.makedirs(directory, exist_ok=True)
+        temp_fd, temp_path = tempfile.mkstemp(
+            prefix=f'.{os.path.basename(path)}.', suffix='.tmp', dir=directory,
+        )
+        try:
+            with os.fdopen(temp_fd, 'w', encoding='utf-8') as stream:
+                json.dump(data, stream, ensure_ascii=False, indent=2)
+            os.replace(temp_path, path)
+        except BaseException:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.debug('Failed to clean atomic JSON temp file', exc_info=True)
+            raise
+
+
+def _is_recognized_legacy_app_config(path):
+    """Return True only when a legacy JSON document is clearly app settings."""
+    try:
+        with open(path, 'r', encoding='utf-8') as stream:
+            data = json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        logger.warning("旧版配置文件无法安全识别，保留原文件: %s", exc)
+        return False
+
+    if not isinstance(data, dict):
+        return False
+    if isinstance(data.get('steps'), list):
+        return False
+    return not data or bool(_APP_CONFIG_KEYS.intersection(data))
+
+
+def migrate_legacy_config_file(primary_path, legacy_path):
+    """Atomically move a legacy config to its dedicated filename when possible."""
+    primary_path = os.path.abspath(os.fspath(primary_path))
+    legacy_path = os.path.abspath(os.fspath(legacy_path))
+    if os.path.normcase(primary_path) == os.path.normcase(legacy_path):
+        return primary_path
+
+    with get_shared_file_lock(primary_path):
+        if os.path.exists(primary_path) or not os.path.exists(legacy_path):
+            return primary_path
+        if not _is_recognized_legacy_app_config(legacy_path):
+            logger.warning("检测到旧文件不是可识别的应用配置，已保留原文件以防数据丢失")
+            return legacy_path
+        try:
+            os.replace(legacy_path, primary_path)
+            logger.info("旧版配置文件已迁移到专用扩展名")
+            return primary_path
+        except OSError as exc:
+            if os.path.exists(primary_path):
+                logger.info("旧版配置已由另一实例迁移完成")
+                return primary_path
+            logger.warning("暂时无法迁移旧版配置文件，继续兼容读取: %s", exc)
+            return legacy_path
+
+
+def _passive_overlay_extended_style(current_style):
+    """Add the Windows flags required by a non-activating mouse-through HUD."""
+    return (int(current_style) | _PASSIVE_OVERLAY_STYLE_MASK) & ~_WS_EX_APPWINDOW
 
 class HotkeyUtils:
     PYNPUT_TO_VK = {
@@ -205,16 +365,34 @@ def init_system_runtime():
             except Exception:
                 pass
 
-def set_windows_app_id(app_version):
-    """设置 Windows AppUserModelID 以确保任务栏图标显示正确"""
+def set_windows_app_id(app_identifier):
+    """Set the stable Windows process identity before any window is created."""
     if sys.platform == 'win32':
         try:
-            myappid = f'hxlive.macromate.{app_version}'
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+            setter = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+            setter.argtypes = (wintypes.LPCWSTR,)
+            setter.restype = ctypes.c_long
+            result = setter(str(app_identifier))
+            if result != 0:
+                raise OSError(f'SetCurrentProcessExplicitAppUserModelID failed: HRESULT {result:#x}')
             return True
         except Exception as e:
             logger.warning(f"设置 AppUserModelID 失败: {e}")
     return False
+
+
+def apply_window_icon(window, icon_path, *, set_default=False):
+    """Apply an ICO to one Tk window and optionally all future Toplevels."""
+    if not icon_path or not os.path.isfile(icon_path):
+        return False
+    try:
+        if set_default:
+            window.iconbitmap(default=icon_path)
+        window.iconbitmap(icon_path)
+        return True
+    except (OSError, tk.TclError) as exc:
+        logger.warning("设置窗口图标失败: %s", exc)
+        return False
 
 def _get_virtual_screen_rect():
     """Return the physical virtual-screen rectangle as (x, y, width, height)."""
@@ -1356,21 +1534,184 @@ def _calculate_mini_status_position(pointer, fallback_rect, virtual_rect, window
     monitor_x, monitor_y, _monitor_w, monitor_h = selected
     return monitor_x + 10, monitor_y + max(0, monitor_h - window_height - 50)
 
+
+def _calculate_taskbar_status_position(monitor_rect, work_rect, window_size, position_mode):
+    """Return a passive status bar position relative to the monitor taskbar."""
+    monitor_x, monitor_y, monitor_w, monitor_h = (int(value) for value in monitor_rect)
+    work_x, work_y, work_w, work_h = (int(value) for value in work_rect)
+    window_w, window_h = (max(1, int(value)) for value in window_size)
+    monitor_right = monitor_x + max(0, monitor_w)
+    monitor_bottom = monitor_y + max(0, monitor_h)
+    work_right = work_x + max(0, work_w)
+    work_bottom = work_y + max(0, work_h)
+
+    gaps = {
+        'left': max(0, work_x - monitor_x),
+        'top': max(0, work_y - monitor_y),
+        'right': max(0, monitor_right - work_right),
+        'bottom': max(0, monitor_bottom - work_bottom),
+    }
+    taskbar_edge = max(gaps, key=gaps.get)
+    has_reserved_area = gaps[taskbar_edge] > 0
+    mode = position_mode if position_mode in {'above_taskbar', 'inside_taskbar'} else 'above_taskbar'
+
+    max_x = max(monitor_x, monitor_right - window_w)
+    max_y = max(monitor_y, monitor_bottom - window_h)
+    x = min(max(monitor_x + 10, monitor_x), max_x)
+
+    if not has_reserved_area:
+        return x, max(monitor_y, max_y - 10)
+
+    if taskbar_edge == 'bottom':
+        if mode == 'inside_taskbar':
+            y = work_bottom + max(0, (gaps['bottom'] - window_h) // 2)
+        else:
+            y = work_bottom - window_h
+        return x, min(max(y, monitor_y), max_y)
+
+    if taskbar_edge == 'top':
+        if mode == 'inside_taskbar':
+            y = monitor_y + max(0, (gaps['top'] - window_h) // 2)
+        else:
+            y = work_y
+        return x, min(max(y, monitor_y), max_y)
+
+    # A wide horizontal HUD does not fit safely inside a vertical taskbar.
+    # Place it immediately beside that taskbar in both modes.
+    y = min(max(monitor_y + 10, monitor_y), max_y)
+    if taskbar_edge == 'left':
+        x = work_x
+    else:
+        x = work_right - window_w
+    return min(max(x, monitor_x), max_x), y
+
+
+def _get_monitor_and_work_rect(pointer, fallback_rect):
+    """Return monitor/work rectangles for the pointer, with a portable fallback."""
+    if sys.platform != 'win32':
+        return fallback_rect, fallback_rect
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = (
+            ('cbSize', wintypes.DWORD),
+            ('rcMonitor', wintypes.RECT),
+            ('rcWork', wintypes.RECT),
+            ('dwFlags', wintypes.DWORD),
+        )
+
+    try:
+        user32 = ctypes.windll.user32
+        monitor_from_point = user32.MonitorFromPoint
+        monitor_from_point.argtypes = (wintypes.POINT, wintypes.DWORD)
+        monitor_from_point.restype = wintypes.HMONITOR
+        get_monitor_info = user32.GetMonitorInfoW
+        get_monitor_info.argtypes = (wintypes.HMONITOR, ctypes.POINTER(MONITORINFO))
+        get_monitor_info.restype = wintypes.BOOL
+
+        monitor = monitor_from_point(wintypes.POINT(*map(int, pointer)), 2)
+        info = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+        if not monitor or not get_monitor_info(monitor, ctypes.byref(info)):
+            return fallback_rect, fallback_rect
+
+        def to_rect(rect):
+            return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+
+        return to_rect(info.rcMonitor), to_rect(info.rcWork)
+    except Exception as exc:
+        logger.warning("获取任务栏工作区失败，使用屏幕边界: %s", exc)
+        return fallback_rect, fallback_rect
+
+
+def _configure_passive_overlay(window, exclude_from_capture=True):
+    """Make a Windows overlay mouse-transparent and non-activating."""
+    if sys.platform != 'win32':
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = int(window.winfo_id())
+        get_parent = user32.GetParent
+        get_parent.argtypes = (wintypes.HWND,)
+        get_parent.restype = wintypes.HWND
+        outer_hwnd = get_parent(hwnd)
+        if outer_hwnd:
+            hwnd = int(outer_hwnd)
+
+        pointer_type = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+        get_style = getattr(user32, 'GetWindowLongPtrW', user32.GetWindowLongW)
+        set_style = getattr(user32, 'SetWindowLongPtrW', user32.SetWindowLongW)
+        get_style.argtypes = (wintypes.HWND, ctypes.c_int)
+        get_style.restype = pointer_type
+        set_style.argtypes = (wintypes.HWND, ctypes.c_int, pointer_type)
+        set_style.restype = pointer_type
+
+        GWL_EXSTYLE = -20
+        style = get_style(hwnd, GWL_EXSTYLE)
+        set_style(hwnd, GWL_EXSTYLE, _passive_overlay_extended_style(style))
+        applied_style = int(get_style(hwnd, GWL_EXSTYLE))
+        if applied_style & _PASSIVE_OVERLAY_STYLE_MASK != _PASSIVE_OVERLAY_STYLE_MASK:
+            raise OSError("window style verification failed")
+        if applied_style & _WS_EX_APPWINDOW:
+            raise OSError("overlay still has an application taskbar style")
+
+        set_layered_attributes = user32.SetLayeredWindowAttributes
+        set_layered_attributes.argtypes = (
+            wintypes.HWND, wintypes.COLORREF, wintypes.BYTE, wintypes.DWORD,
+        )
+        set_layered_attributes.restype = wintypes.BOOL
+        if not set_layered_attributes(hwnd, 0, 255, 0x00000002):
+            raise OSError("layered window attributes failed")
+
+        set_window_pos = user32.SetWindowPos
+        set_window_pos.argtypes = (
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        )
+        set_window_pos.restype = wintypes.BOOL
+        if not set_window_pos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020):
+            raise OSError("window style refresh failed")
+
+        if exclude_from_capture:
+            try:
+                set_affinity = user32.SetWindowDisplayAffinity
+                set_affinity.argtypes = (wintypes.HWND, wintypes.DWORD)
+                set_affinity.restype = wintypes.BOOL
+                set_affinity(hwnd, 0x00000011)
+            except (AttributeError, OSError):
+                pass
+        return True
+    except Exception as exc:
+        logger.warning("设置悬浮条鼠标穿透失败: %s", exc)
+        return False
+
+
+def _apply_or_hide_passive_overlay(window, exclude_from_capture=True):
+    """Hide the HUD unless mouse transparency is confirmed."""
+    if _configure_passive_overlay(window, exclude_from_capture=exclude_from_capture):
+        return True
+    try:
+        window.withdraw()
+    except tk.TclError:
+        pass
+    logger.warning("悬浮条已隐藏，以避免阻挡宏的鼠标操作")
+    return False
+
+
 class MiniStatusWindow:
     """
     宏执行时的迷你悬浮状态栏窗口
-    - 无边框、始终置顶，显示于屏幕左下角
-    - 点击可停止宏
+    - 无边框、始终置顶，显示于任务栏附近
+    - 鼠标穿透且不抢焦点，停止宏请使用全局快捷键
     """
-    def __init__(self, parent, stop_callback):
+    def __init__(self, parent, position_mode='above_taskbar', exclude_from_capture=True,
+                 icon_path=None):
         self.parent = parent
-        self.stop_callback = stop_callback
 
         self.window = tk.Toplevel(parent)
+        apply_window_icon(self.window, icon_path)
         self.window.overrideredirect(True)
         self.window.attributes('-topmost', True)
 
-        window_width = 500
+        window_width = MINI_STATUS_WIDTH
         window_height = 35
         pointer = self.window.winfo_pointerxy()
         screen_height = self.window.winfo_screenheight()
@@ -1380,14 +1721,14 @@ class MiniStatusWindow:
             self.window.winfo_vrootwidth(),
             self.window.winfo_vrootheight() or screen_height,
         )
-        virtual_rect = _get_virtual_screen_rect() if sys.platform == 'win32' else None
-        x, y = _calculate_mini_status_position(
-            pointer,
-            fallback_rect,
-            virtual_rect,
-            window_height,
+        monitor_rect, work_rect = _get_monitor_and_work_rect(pointer, fallback_rect)
+        x, y = _calculate_taskbar_status_position(
+            monitor_rect,
+            work_rect,
+            (window_width, window_height),
+            position_mode,
         )
-        self.window.geometry(f"{window_width}x{window_height}+{x}+{y}")
+        self.window.geometry(f"{window_width}x{window_height}{x:+d}{y:+d}")
 
         main_frame = ttk.Frame(self.window, bootstyle="primary", padding=0)
         main_frame.pack(fill=tk.BOTH, expand=True)
@@ -1405,15 +1746,11 @@ class MiniStatusWindow:
             bootstyle="primary-inverse", font=("Microsoft YaHei UI", 9)
         )
         self.loop_label.pack(side=tk.RIGHT)
-
-        for w in (main_frame, self.status_label, self.loop_label):
-            w.bind("<Button-1>", self._on_click)
-            w.bind("<Enter>", lambda e: self.window.config(cursor="hand2"))
-            w.bind("<Leave>", lambda e: self.window.config(cursor=""))
-
-    def _on_click(self, event):
-        if self.stop_callback:
-            self.stop_callback()
+        self.window.update_idletasks()
+        self.is_visible = _apply_or_hide_passive_overlay(
+            self.window,
+            exclude_from_capture=exclude_from_capture,
+        )
 
     def update_status(self, status_text, loop_text=""):
         """更新状态栏显示内容"""
@@ -1533,4 +1870,3 @@ class AboutDialog:
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Button(button_frame, text="确  定", command=self.dialog.destroy, bootstyle="primary", width=18, padding=(15, 8)).pack(anchor="center")
-

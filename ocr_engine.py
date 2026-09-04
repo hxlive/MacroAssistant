@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # ocr_engine.py
 # 功能说明：OCR 识别引擎，负责多后端探测、文字识别、文本匹配与结果缓存
-# 版本:1.8.5
+# 版本:1.8.6
 
 from PIL import Image
 import importlib

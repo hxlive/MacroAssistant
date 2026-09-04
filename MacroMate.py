@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 # MacroMate.py
 # 功能说明：应用入口与 GUI 外壳，负责界面生命周期、宏运行控制和配置持久化
-# Version: 1.8.5
-APP_VERSION = "1.8.5"
+# Version: 1.8.6
+APP_VERSION = "1.8.6"
+MINI_STATUS_POSITION_MODES = frozenset({'above_taskbar', 'inside_taskbar'})
 
 # 使用:
 #   - GUI 模式: python MacroMate.py
@@ -127,6 +128,7 @@ _configure_console_logging()
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import json
+import re
 import pyautogui
 import threading
 import ttkbootstrap as tb
@@ -142,9 +144,12 @@ ctypes.pythonapi.PyThreadState_SetAsyncExc.restype = ctypes.c_int
 
 APP_TITLE = f"智点助手 (MacroMate) v{APP_VERSION}"
 APP_ICON = "app_icon.ico"
+APP_USER_MODEL_ID = "hxlive.macromate"
 
-CONFIG_FILE = os.path.join(APP_DIR, "macro_settings.json")
-MAX_RECENT_FILES = 5
+CONFIG_FILE = os.path.join(APP_DIR, "macro_settings.mmcfg")
+LEGACY_CONFIG_FILE = os.path.join(APP_DIR, "macro_settings.json")
+_DEFAULT_CONFIG_FILE = CONFIG_FILE
+MAX_RECENT_FILES = 8
 
 DEFAULT_HOTKEY_RUN = "ctrl+f1"
 DEFAULT_HOTKEY_STOP = "ctrl+f2"
@@ -159,6 +164,8 @@ KNOWN_THEMES = frozenset((
 STATUS_QUEUE_CHECK_INTERVAL_IDLE = 500  # 空闲时状态队列检查间隔（毫秒）
 STATUS_QUEUE_CHECK_INTERVAL_RUNNING = 50  # 运行时状态队列检查间隔（毫秒）
 STATUS_QUEUE_MAX_BATCH = 50  # 状态队列单次最大处理数
+FORCE_STOP_DELAY_MS = 2500
+FORCE_STOP_VERIFY_MS = 1000
 
 
 
@@ -241,14 +248,34 @@ class MacroPersistence:
 def capitalize_hotkey_str(s): return HotkeyUtils.format_hotkey_display(s)
 
 
+def _resolve_app_config_path():
+    """Return the readable settings path, migrating the production legacy file."""
+    if os.path.normcase(os.path.abspath(CONFIG_FILE)) != os.path.normcase(os.path.abspath(_DEFAULT_CONFIG_FILE)):
+        return CONFIG_FILE
+    return sys_utils.migrate_legacy_config_file(CONFIG_FILE, LEGACY_CONFIG_FILE)
+
+
+def _normalized_file_path(path):
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.fspath(path))))
+
+
+def _is_reserved_config_path(path):
+    candidate = _normalized_file_path(path)
+    return candidate in {
+        _normalized_file_path(CONFIG_FILE),
+        _normalized_file_path(LEGACY_CONFIG_FILE),
+    }
+
+
 class MacroApp:
 
     # ================================================================
     # Lifecycle And Setup
     # ================================================================
 
-    def __init__(self, root):
+    def __init__(self, root, icon_path=None):
         self.root = root
+        self.app_icon_path = icon_path
         self._setup_window()
         self._setup_app_state()
         self._setup_hotkeys()
@@ -273,25 +300,13 @@ class MacroApp:
         self.is_app_running = True
         self.root.protocol("WM_DELETE_WINDOW", self.on_exit)
 
-        icon_path = get_icon_path(APP_ICON, APP_VERSION)
-        if icon_path and os.path.exists(icon_path):
-            try:
-                # Set AppUserModelID before iconbitmap for taskbar icon stability.
-                sys_utils.set_windows_app_id(APP_VERSION)
-                logger.info(f"AppUserModelID set: {APP_VERSION}")
-                self.root.iconbitmap(icon_path)
-                logger.info("icon set: %s", os.path.basename(icon_path))
-            except Exception as e:
-                logger.error(f"设置图标失败: {e}")
-        else:
-            logger.warning("未找到图标文件，使用默认图标")
-
     def _setup_app_state(self):
         # === Macro Run State Machine ===
         self.is_macro_running = False
         self.current_run_context = None
         self._macro_thread = None
         self._stop_in_progress = False
+        self._stop_request_id = 0
         self._run_pending = False
         self._pending_run_id = None
 
@@ -304,7 +319,7 @@ class MacroApp:
         self.current_filepath = None
 
         # === Main-thread Queues ===
-        self.status_queue = queue.Queue()
+        self.status_queue = queue.Queue(maxsize=1)
         self._ui_callback_queue = queue.Queue()
 
     def _setup_hotkeys(self):
@@ -324,6 +339,7 @@ class MacroApp:
         self.dont_minimize_var = tb.BooleanVar(value=False)
         self.enhanced_mode_var = tb.BooleanVar(value=False)
         self.run_enabled_var = tb.BooleanVar(value=False)
+        self.mini_status_position_var = tb.StringVar(value='above_taskbar')
 
     def _setup_mouse_tracker(self):
         self.mouse_pos_var = tb.StringVar()
@@ -485,9 +501,33 @@ class MacroApp:
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.on_exit)
 
-        self.root.bind('<Control-n>', lambda e: self.new_macro())
-        self.root.bind('<Control-o>', lambda e: self.load_macro())
-        self.root.bind('<Control-s>', lambda e: self.save_macro())
+        self._bind_file_shortcuts()
+
+    def _bind_file_shortcuts(self):
+        """Bind file shortcuts without relying on a keyboard-layout-specific keysym."""
+        self.root.bind('<Control-KeyPress>', self._handle_file_shortcut, add='+')
+
+    def _handle_file_shortcut(self, event):
+        shortcut_actions = {
+            'n': 'new_macro',
+            'o': 'load_macro',
+            's': 'save_macro',
+        }
+        key = str(getattr(event, 'keysym', '') or '').lower()
+        action_name = shortcut_actions.get(key)
+        if action_name is None and sys.platform == 'win32':
+            action_name = {
+                ord('N'): 'new_macro',
+                ord('O'): 'load_macro',
+                ord('S'): 'save_macro',
+            }.get(getattr(event, 'keycode', None))
+        if action_name is None:
+            return None
+        return self._run_file_shortcut(action_name)
+
+    def _run_file_shortcut(self, action_name):
+        getattr(self, action_name)()
+        return 'break'
 
     def _build_settings_menu(self):
         settings_menu = tk.Menu(self.menu_bar, tearoff=0, font=self.font_ui)
@@ -495,6 +535,21 @@ class MacroApp:
         settings_menu.add_command(label="⌨ 快捷键设置...", command=self.open_hotkey_settings)
         settings_menu.add_separator()
         settings_menu.add_command(label="🤖 AI 设置...", command=self.open_vlm_settings)
+        settings_menu.add_separator()
+        mini_status_menu = tk.Menu(settings_menu, tearoff=0, font=self.font_ui)
+        settings_menu.add_cascade(label="悬浮条位置", menu=mini_status_menu)
+        mini_status_menu.add_radiobutton(
+            label="紧贴任务栏上沿（推荐）",
+            variable=self.mini_status_position_var,
+            value='above_taskbar',
+            command=self.save_app_settings,
+        )
+        mini_status_menu.add_radiobutton(
+            label="任务栏内部（实验）",
+            variable=self.mini_status_position_var,
+            value='inside_taskbar',
+            command=self.save_app_settings,
+        )
 
     def _build_theme_menu(self):
         theme_menu = tk.Menu(self.menu_bar, tearoff=0, font=self.font_ui)
@@ -586,8 +641,12 @@ class MacroApp:
     def _format_run_button_text(self, run_display):
         return f"▶ 运行宏 ({run_display})"
 
-    def _format_mini_run_status(self, stop_display):
-        return f"宏正在运行... [点击停止 或 {stop_display}]"
+    def _format_mini_run_status(self, stop_display, loop_status=""):
+        """Return compact left/right text while keeping the stop hotkey visible."""
+        progress = loop_status.strip() if isinstance(loop_status, str) else ""
+        progress = re.sub(r'\s*/\s*', '/', progress)
+        left_text = f"MacroMate：{progress or '运行中'}"
+        return left_text, f"｜{stop_display} 停止"
 
     def update_status_bar_hotkeys(self):
         """更新状态栏和运行按钮上的快捷键提示"""
@@ -680,7 +739,7 @@ class MacroApp:
             self._about_dialog_ref.dialog.focus_force()
             return
 
-        icon_path = get_icon_path(APP_ICON, APP_VERSION)
+        icon_path = self.app_icon_path or get_icon_path(APP_ICON, APP_VERSION)
         self._about_dialog_ref = AboutDialog(self.root, APP_VERSION, icon_path)
 
     def on_exit(self):
@@ -777,10 +836,13 @@ class MacroApp:
             except Exception:
                 pass
             self.mini_status_window = None
-        self.mini_status_window = MiniStatusWindow(self.root, self.safe_stop_macro)
+        self.mini_status_window = MiniStatusWindow(
+            self.root,
+            position_mode=self.mini_status_position_var.get(),
+            icon_path=self.app_icon_path,
+        )
         self.mini_status_window.update_status(
-            self._format_mini_run_status(stop_display),
-            ""
+            *self._format_mini_run_status(stop_display)
         )
         self.root.iconify()
 
@@ -886,22 +948,44 @@ class MacroApp:
         if not self.is_macro_running:
             return
         self._stop_in_progress = True
+        self._stop_request_id = getattr(self, '_stop_request_id', 0) + 1
+        request_id = self._stop_request_id
         self.root.after(0, self.status_var.set, "正在停止...")
         if self.current_run_context:
             macro_engine.request_stop(self.current_run_context)
             macro_engine.cleanup_active_processes(self.current_run_context)
-        self.root.after(2500, self._force_stop_macro_if_needed)
+        self.root.after(FORCE_STOP_DELAY_MS, self._force_stop_macro_if_needed, request_id)
 
-    def _force_stop_macro_if_needed(self):
+    def _allow_stop_retry(self, request_id, message):
+        if request_id != getattr(self, '_stop_request_id', 0) or not self.is_macro_running:
+            return
+        self._stop_in_progress = False
+        self.status_var.set(message)
+
+    def _verify_force_stop_result(self, request_id):
+        """Release the stop latch if async injection did not finish the worker."""
+        if request_id != getattr(self, '_stop_request_id', 0):
+            return
+        thread = self._macro_thread
+        if self.is_macro_running and thread and thread.is_alive():
+            self._allow_stop_retry(request_id, "仍在停止，可再次按停止快捷键重试")
+
+    def _force_stop_macro_if_needed(self, request_id=None):
         """Last-resort stop for code paths that do not reach cooperative checks."""
+        if request_id is None:
+            request_id = getattr(self, '_stop_request_id', 0)
+        if request_id != getattr(self, '_stop_request_id', 0):
+            return
         if not self._stop_in_progress or not self.is_macro_running:
             return
         t = self._macro_thread
         if not (t and t.is_alive()):
+            self._stop_in_progress = False
             return
         tid = t.ident
         if not tid:
             logger.error("中断: thread ID invalid; exception not injected")
+            self._allow_stop_retry(request_id, "停止未完成，可再次按停止快捷键重试")
             return
         force_stop_enabled = bool(
             self.current_run_context
@@ -911,18 +995,31 @@ class MacroApp:
             logger.warning("Stop: cooperative stop timed out; force thread injection is disabled")
             if self.current_run_context:
                 macro_engine.cleanup_active_processes(self.current_run_context)
+            self._allow_stop_retry(request_id, "停止未完成，可再次按停止快捷键重试")
             return
-        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
-            ctypes.c_ulong(tid),
-            ctypes.py_object(macro_engine.MacroStopException)
-        )
+        try:
+            res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(tid),
+                ctypes.py_object(macro_engine.MacroStopException)
+            )
+        except Exception:
+            logger.exception("Stop: async exception injection failed")
+            self._allow_stop_retry(request_id, "停止未完成，可再次按停止快捷键重试")
+            return
         if res == 0:
             logger.error("Stop: thread ID invalid; exception not injected")
+            self._allow_stop_retry(request_id, "停止未完成，可再次按停止快捷键重试")
         elif res > 1:
-            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
-            logger.warning("Stop: exception affected multiple threads and was reverted")
+            try:
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
+                logger.warning("Stop: exception affected multiple threads and was reverted")
+            except Exception:
+                logger.exception("Stop: failed to revert multi-thread async exception")
+            finally:
+                self._allow_stop_retry(request_id, "停止未完成，可再次按停止快捷键重试")
         else:
             logger.info("Stop: cooperative stop timed out; MacroStopException injected")
+            self.root.after(FORCE_STOP_VERIFY_MS, self._verify_force_stop_result, request_id)
 
     def _restore_macro_idle_ui(self):
         if self.mini_status_window:
@@ -936,6 +1033,7 @@ class MacroApp:
     def _on_macro_complete(self):
         self.is_macro_running = False
         self._stop_in_progress = False
+        self._stop_request_id = getattr(self, '_stop_request_id', 0) + 1
         if self.current_run_context:
             macro_engine.cleanup_active_processes(self.current_run_context)
         self.current_run_context = None
@@ -950,7 +1048,15 @@ class MacroApp:
     # ================================================================
 
     def update_loop_status(self, text):
-        self.status_queue.put(text)
+        while True:
+            try:
+                self.status_queue.put_nowait(text)
+                return
+            except queue.Full:
+                try:
+                    self.status_queue.get_nowait()
+                except queue.Empty:
+                    pass
 
     def _queue_ui_callback(self, callback):
         if self.is_app_running:
@@ -999,10 +1105,10 @@ class MacroApp:
             if self.mini_status_window:
                 stop_display = capitalize_hotkey_str(self.hotkey_stop_str.get())
                 current_loop_status = self.loop_status_var.get()
-                new_status = (self._format_mini_run_status(stop_display), current_loop_status)
+                new_status = self._format_mini_run_status(stop_display, current_loop_status)
                 if new_status != self._last_mini_status:
                     self._last_mini_status = new_status
-                    self.mini_status_window.update_status(new_status[0], new_status[1])
+                    self.mini_status_window.update_status(*new_status)
         except queue.Empty:
             pass
         except Exception as e:
@@ -1038,6 +1144,12 @@ class MacroApp:
             return
         f = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
         if f:
+            if _is_reserved_config_path(f):
+                messagebox.showerror(
+                    "保存失败",
+                    "不能使用 MacroMate 的配置文件路径保存宏，请选择其他文件名。",
+                )
+                return
             try:
                 MacroPersistence.save(f, steps)
                 self.current_filepath = f
@@ -1096,10 +1208,11 @@ class MacroApp:
         return self._read_app_settings_file(log_errors=True)
 
     def _read_app_settings_file(self, log_errors=False):
-        if not os.path.exists(CONFIG_FILE):
+        read_path = _resolve_app_config_path()
+        if not os.path.exists(read_path):
             return {}
         try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            with open(read_path, 'r', encoding='utf-8') as f:
                 settings = json.load(f)
             return settings if isinstance(settings, dict) else {}
         except (OSError, json.JSONDecodeError, TypeError) as e:
@@ -1144,6 +1257,11 @@ class MacroApp:
         normalized['hotkey_run'] = run_hotkey
         normalized['hotkey_stop'] = stop_hotkey
 
+        mini_status_position = normalized.get('mini_status_position', 'above_taskbar')
+        if mini_status_position not in MINI_STATUS_POSITION_MODES:
+            mini_status_position = 'above_taskbar'
+        normalized['mini_status_position'] = mini_status_position
+
         for key in ('enhanced_mode', 'run_enabled', 'skip_confirm', 'dont_minimize'):
             value = normalized.get(key, False)
             normalized[key] = value if isinstance(value, bool) else False
@@ -1159,6 +1277,7 @@ class MacroApp:
         self.run_enabled_var.set(settings['run_enabled'])
         self.skip_confirm_var.set(settings['skip_confirm'])
         self.dont_minimize_var.set(settings['dont_minimize'])
+        self.mini_status_position_var.set(settings['mini_status_position'])
 
     def save_app_settings(self):
         """保存应用设置"""
@@ -1183,23 +1302,13 @@ class MacroApp:
             'run_enabled': self.run_enabled_var.get(),
             'skip_confirm': self.skip_confirm_var.get(),
             'dont_minimize': self.dont_minimize_var.get(),
+            'mini_status_position': self.mini_status_position_var.get(),
         }
 
     def _write_app_settings(self, settings):
-        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-        tmp_path = CONFIG_FILE + '.tmp'
-        try:
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(settings, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, CONFIG_FILE)
-        except BaseException:
-            try:
-                os.remove(tmp_path)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                logger.debug('Failed to clean app settings temp file', exc_info=True)
-            raise
+        import vlm_engine
+        stored_settings = vlm_engine.prepare_app_config_for_storage(settings)
+        sys_utils.write_json_file_atomically(CONFIG_FILE, stored_settings)
 
     def change_theme(self):
         self.root.style.theme_use(self.current_theme.get())
@@ -1276,8 +1385,19 @@ def _finish_cli_run(result):
 def _run_gui(theme):
     """GUI 模式：创建主窗口并进入 mainloop。"""
     pyautogui.FAILSAFE = True
+    if sys_utils.set_windows_app_id(APP_USER_MODEL_ID):
+        logger.info("AppUserModelID set: %s", APP_USER_MODEL_ID)
+    else:
+        logger.warning("AppUserModelID could not be set before window creation")
+    icon_path = get_icon_path(APP_ICON, APP_VERSION)
     main_window = tb.Window(themename=theme)
-    MacroApp(main_window)
+    main_window.withdraw()
+    if sys_utils.apply_window_icon(main_window, icon_path, set_default=True):
+        logger.info("icon set before first window display: %s", os.path.basename(icon_path))
+    else:
+        logger.warning("未找到或无法应用图标文件，使用默认图标")
+    MacroApp(main_window, icon_path=icon_path)
+    main_window.deiconify()
     main_window.mainloop()
 
 
@@ -1295,8 +1415,9 @@ def _resolve_initial_theme(cli_theme):
     """从配置文件解析初始主题，失败时回退到 CLI 指定主题。"""
     fallback_theme = cli_theme if cli_theme in KNOWN_THEMES else 'litera'
     try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+        read_path = _resolve_app_config_path()
+        if os.path.exists(read_path):
+            with open(read_path, 'r', encoding='utf-8') as f:
                 theme_config = json.load(f)
             if isinstance(theme_config, dict):
                 configured_theme = theme_config.get('theme')

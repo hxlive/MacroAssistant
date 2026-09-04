@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # screen_locator.py
 # 功能说明：统一屏幕定位服务，负责截图、图像匹配、OCR/VLM 调用适配与定位状态管理
-# Version: 1.8.5
+# Version: 1.8.6
 
 """屏幕目标定位的统一契约与后端实现。
 
@@ -413,6 +413,42 @@ def smart_screenshot(region=None, pad: int = 0):
         raise
     except Exception as exc:
         raise ScreenCaptureError('Screen capture is unavailable') from exc
+
+
+def sample_screen_pixel(x: int, y: int) -> tuple[int, int, int]:
+    """Return one physical-screen pixel as an RGB tuple.
+
+    Coordinates use the virtual desktop coordinate space, so negative values on
+    monitors placed left of or above the primary display are supported.
+    """
+    try:
+        x = int(x)
+        y = int(y)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError('pixel coordinates must be integers') from exc
+
+    screenshot = None
+    rgb_image = None
+    try:
+        screenshot, _offset = capture_physical_bbox((x, y, x + 1, y + 1))
+        rgb_image = screenshot.convert('RGB')
+        pixel = rgb_image.getpixel((0, 0))
+        return int(pixel[0]), int(pixel[1]), int(pixel[2])
+    except ScreenCaptureError:
+        raise
+    except Exception as exc:
+        raise ScreenCaptureError(f'Unable to sample screen pixel at ({x}, {y})') from exc
+    finally:
+        if rgb_image is not None and rgb_image is not screenshot:
+            try:
+                rgb_image.close()
+            except Exception:
+                pass
+        if screenshot is not None:
+            try:
+                screenshot.close()
+            except Exception:
+                pass
 
 
 def _clear_template_cache():

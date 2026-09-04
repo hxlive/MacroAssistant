@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 # vlm_engine.py
 # 功能说明：视觉语言模型接口，负责配置管理、屏幕编码、API 适配与坐标解析
-# Version: 1.8.5
+# Version: 1.8.6
 # 处理流程：将屏幕截图编码为 Base64，随自然语言指令发送给模型并解析目标坐标
 
 import base64
 import copy
+import ctypes
 import json
 import os
 import sys
@@ -35,8 +36,12 @@ def _get_program_dir():
 
 
 APP_DIR = _get_program_dir()
-APP_CONFIG_FILE = os.path.join(APP_DIR, "macro_settings.json")
+APP_CONFIG_FILE = os.path.join(APP_DIR, "macro_settings.mmcfg")
+LEGACY_APP_CONFIG_FILE = os.path.join(APP_DIR, "macro_settings.json")
+_DEFAULT_APP_CONFIG_FILE = APP_CONFIG_FILE
 VLM_CONFIG_KEY = "vlm"
+_PROTECTED_API_KEY_PREFIX = 'dpapi:'
+_DPAPI_ENTROPY = b'MacroMate/VLM/API-Key/v1'
 
 # 默认配置
 DEFAULT_CONFIG = {
@@ -142,10 +147,138 @@ def _merge_user_config(default, user_config):
     return merged
 
 
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = (
+        ('cbData', ctypes.c_ulong),
+        ('pbData', ctypes.POINTER(ctypes.c_ubyte)),
+    )
+
+
+def _make_data_blob(data):
+    buffer = ctypes.create_string_buffer(data)
+    blob = _DATA_BLOB(
+        len(data),
+        ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)),
+    )
+    return blob, buffer
+
+
+def _protect_api_key(api_key):
+    """Protect an API key for the current Windows user with DPAPI."""
+    if not api_key:
+        return ''
+    if sys.platform != 'win32':
+        logger.error("API Key 加密仅支持 Windows，已拒绝明文保存")
+        return None
+    try:
+        raw_blob, raw_buffer = _make_data_blob(str(api_key).encode('utf-8'))
+        entropy_blob, entropy_buffer = _make_data_blob(_DPAPI_ENTROPY)
+        output_blob = _DATA_BLOB()
+        crypt_protect = ctypes.windll.crypt32.CryptProtectData
+        crypt_protect.argtypes = (
+            ctypes.POINTER(_DATA_BLOB), ctypes.c_wchar_p,
+            ctypes.POINTER(_DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_ulong, ctypes.POINTER(_DATA_BLOB),
+        )
+        crypt_protect.restype = ctypes.c_bool
+        if not crypt_protect(
+                ctypes.byref(raw_blob), None, ctypes.byref(entropy_blob),
+                None, None, 0x1, ctypes.byref(output_blob)):
+            raise OSError("CryptProtectData failed")
+        try:
+            protected = ctypes.string_at(output_blob.pbData, output_blob.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(output_blob.pbData)
+        # Keep input buffers alive until the native call has completed.
+        _ = raw_buffer, entropy_buffer
+        return _PROTECTED_API_KEY_PREFIX + base64.b64encode(protected).decode('ascii')
+    except Exception:
+        logger.exception("API Key 加密失败，已拒绝明文保存")
+        return None
+
+
+def _unprotect_api_key(stored_value):
+    """Decode a DPAPI value; return None when it cannot be safely recovered."""
+    if not isinstance(stored_value, str) or not stored_value.startswith(_PROTECTED_API_KEY_PREFIX):
+        return stored_value
+    if sys.platform != 'win32':
+        return None
+    try:
+        protected = base64.b64decode(
+            stored_value[len(_PROTECTED_API_KEY_PREFIX):], validate=True,
+        )
+        protected_blob, protected_buffer = _make_data_blob(protected)
+        entropy_blob, entropy_buffer = _make_data_blob(_DPAPI_ENTROPY)
+        output_blob = _DATA_BLOB()
+        crypt_unprotect = ctypes.windll.crypt32.CryptUnprotectData
+        crypt_unprotect.argtypes = (
+            ctypes.POINTER(_DATA_BLOB), ctypes.POINTER(ctypes.c_wchar_p),
+            ctypes.POINTER(_DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_ulong, ctypes.POINTER(_DATA_BLOB),
+        )
+        crypt_unprotect.restype = ctypes.c_bool
+        if not crypt_unprotect(
+                ctypes.byref(protected_blob), None, ctypes.byref(entropy_blob),
+                None, None, 0x1, ctypes.byref(output_blob)):
+            raise OSError("CryptUnprotectData failed")
+        try:
+            raw = ctypes.string_at(output_blob.pbData, output_blob.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(output_blob.pbData)
+        _ = protected_buffer, entropy_buffer
+        return raw.decode('utf-8')
+    except Exception:
+        logger.exception("API Key 解密失败，请重新输入并保存")
+        return None
+
+
+def _prepare_vlm_config_for_storage(config, allow_existing_protected=False):
+    stored = copy.deepcopy(config)
+    stored.pop('_api_key_source', None)
+    api_key = stored.get('api_key', '')
+    if not api_key:
+        stored['api_key'] = ''
+        return stored
+    if allow_existing_protected and isinstance(api_key, str) \
+            and api_key.startswith(_PROTECTED_API_KEY_PREFIX):
+        return stored
+    protected = _protect_api_key(api_key)
+    if protected is None:
+        raise OSError("API Key protection failed")
+    stored['api_key'] = protected
+    return stored
+
+
+def prepare_app_config_for_storage(app_config):
+    """Return an app-config copy whose VLM secret is safe for disk storage."""
+    stored = copy.deepcopy(app_config)
+    vlm_config = stored.get(VLM_CONFIG_KEY)
+    if isinstance(vlm_config, dict):
+        stored[VLM_CONFIG_KEY] = _prepare_vlm_config_for_storage(
+            vlm_config,
+            allow_existing_protected=True,
+        )
+    return stored
+
+
 def _load_user_config():
-    app_config = _read_json_file(APP_CONFIG_FILE)
+    app_config = _read_json_file(_resolve_app_config_path())
     vlm_config = app_config.get(VLM_CONFIG_KEY)
-    return vlm_config if isinstance(vlm_config, dict) else {}
+    if not isinstance(vlm_config, dict):
+        return {}
+    loaded = copy.deepcopy(vlm_config)
+    stored_api_key = loaded.get('api_key', '')
+    if isinstance(stored_api_key, str) and stored_api_key.startswith(_PROTECTED_API_KEY_PREFIX):
+        loaded['api_key'] = _unprotect_api_key(stored_api_key) or ''
+    return loaded
+
+
+def _resolve_app_config_path():
+    """Return the readable app config path without migrating patched test paths."""
+    if os.path.normcase(os.path.abspath(APP_CONFIG_FILE)) != os.path.normcase(os.path.abspath(_DEFAULT_APP_CONFIG_FILE)):
+        return APP_CONFIG_FILE
+    from sys_utils import migrate_legacy_config_file
+    return migrate_legacy_config_file(APP_CONFIG_FILE, LEGACY_APP_CONFIG_FILE)
 
 
 def _get_env_api_key(provider):
@@ -198,26 +331,17 @@ def save_config(config):
         logger.error("保存配置失败: VLM config must be a dictionary")
         return False
 
-    tmp_path = APP_CONFIG_FILE + '.tmp'
     with _vlm_lock, get_shared_file_lock(APP_CONFIG_FILE):
         try:
             config_copy = copy.deepcopy(config)
-            read_path = APP_CONFIG_FILE
+            read_path = _resolve_app_config_path()
             app_config = _read_json_file(read_path)
-            app_config[VLM_CONFIG_KEY] = config_copy
-            os.makedirs(os.path.dirname(APP_CONFIG_FILE), exist_ok=True)
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(app_config, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, APP_CONFIG_FILE)
+            app_config[VLM_CONFIG_KEY] = _prepare_vlm_config_for_storage(config_copy)
+            from sys_utils import write_json_file_atomically
+            write_json_file_atomically(APP_CONFIG_FILE, app_config)
             _vlm_config = copy.deepcopy(config_copy)
             return True
         except Exception as e:
-            try:
-                os.remove(tmp_path)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                logger.debug("Failed to clean VLM config temp file", exc_info=True)
             logger.error(f"保存配置失败: {e}")
             return False
 
